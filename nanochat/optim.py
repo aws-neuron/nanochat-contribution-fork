@@ -12,7 +12,10 @@ Further contributions from @karpathy and @chrisjmccormick.
 import torch
 import torch.distributed as dist
 from torch import Tensor
-from nanochat.common import COMPUTE_DTYPE
+from nanochat.common import COMPUTE_DTYPE, neuron_available
+
+# The fused steps below are compiled; inductor has no Neuron codegen, so pick the backend up front.
+COMPILE_BACKEND = "neuron" if neuron_available() else "inductor"
 
 # -----------------------------------------------------------------------------
 """
@@ -20,7 +23,7 @@ Good old AdamW optimizer, fused kernel.
 https://arxiv.org/abs/1711.05101
 """
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(dynamic=False, fullgraph=True, backend=COMPILE_BACKEND)
 def adamw_step_fused(
     p: Tensor,              # (32768, 768) - parameter tensor
     grad: Tensor,           # (32768, 768) - gradient, same shape as p
@@ -108,7 +111,7 @@ polar_express_coeffs = [
 ]
 
 
-@torch.compile(dynamic=False, fullgraph=True)
+@torch.compile(dynamic=False, fullgraph=True, backend=COMPILE_BACKEND)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
     stacked_params: Tensor,         # (12, 768, 3072) - stacked parameters

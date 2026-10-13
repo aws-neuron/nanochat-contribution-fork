@@ -14,6 +14,14 @@ from filelock import FileLock
 # Linear layers cast their weights to this dtype in forward, replacing torch.amp.autocast.
 # Override with NANOCHAT_DTYPE env var: "bfloat16", "float16", "float32"
 _DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+def neuron_available():
+    """True when this PyTorch build has the Neuron (AWS Trainium) device backend."""
+    try:
+        torch.device("neuron")
+    except Exception:
+        return False
+    return True
+
 def _detect_compute_dtype():
     env = os.environ.get("NANOCHAT_DTYPE")
     if env is not None:
@@ -27,6 +35,8 @@ def _detect_compute_dtype():
         # fp16 training requires GradScaler (not yet implemented), so fall back to fp32.
         # Users can still force fp16 via NANOCHAT_DTYPE=float16 if they know what they're doing.
         return torch.float32, f"auto-detected: CUDA SM {capability[0]}{capability[1]} (pre-Ampere, bf16 not supported, using fp32)"
+    if neuron_available():
+        return torch.bfloat16, "auto-detected: Neuron (bf16 is the native NeuronCore compute dtype)"
     # Note: MPS on recent macOS also handles bf16 fine, opt in via NANOCHAT_DTYPE=bfloat16
     return torch.float32, "auto-detected: no CUDA (CPU/MPS)"
 COMPUTE_DTYPE, COMPUTE_DTYPE_REASON = _detect_compute_dtype()
@@ -164,6 +174,8 @@ def autodetect_device_type():
     # prefer to use CUDA if available, otherwise use MPS, otherwise fallback on CPU
     if torch.cuda.is_available():
         device_type = "cuda"
+    elif neuron_available():
+        device_type = "neuron"
     elif torch.backends.mps.is_available():
         device_type = "mps"
     else:
@@ -174,7 +186,7 @@ def autodetect_device_type():
 def compute_init(device_type="cuda"): # cuda|cpu|mps
     """Basic initialization that we keep doing over and over, so make common."""
 
-    assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
+    assert device_type in ["cuda", "mps", "cpu", "neuron"], "Invalid device type atm"
     if device_type == "cuda":
         assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
     if device_type == "mps":
@@ -200,8 +212,12 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
         torch.cuda.set_device(device)  # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
+    elif is_ddp_requested and device_type == "neuron":
+        device = torch.device("neuron") # the runtime assigns this rank a logical NeuronCore
+        dist.init_process_group(backend="neuron")
+        dist.barrier()
     else:
-        device = torch.device(device_type) # mps|cpu
+        device = torch.device(device_type) # mps|cpu|neuron
 
     if ddp_rank == 0:
         logger.info(f"Distributed world size: {ddp_world_size}")

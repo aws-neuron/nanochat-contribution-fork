@@ -86,6 +86,9 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+if device_type == "neuron":
+    import torch_neuronx # the Neuron dispatch is async; without a sync, dt would measure launch time
+    synchronize = torch_neuronx.synchronize
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
@@ -243,7 +246,13 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if device_type == "neuron":
+    # A whole-model graph is too big for the Neuron compiler, but the Blocks are shape-identical, so one
+    # Block graph is compiled once and reused by every layer.
+    for i, block in enumerate(model.transformer.h):
+        model.transformer.h[i] = torch.compile(block, backend="neuron", dynamic=False)
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
