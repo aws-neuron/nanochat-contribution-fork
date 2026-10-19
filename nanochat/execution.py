@@ -49,10 +49,13 @@ import faulthandler, builtins, os, shutil, subprocess, sys
 maximum_memory_bytes = {maximum_memory_bytes}
 if maximum_memory_bytes is not None and sys.platform != "darwin":
     # (the resource limit calls seem to fail on macOS, skip them there)
+    # (only lower the soft limit, never touch the hard one: an unprivileged process may not raise its hard limit,
+    # and some hosts set a low one, e.g. a 10 MiB stack hard limit, so (limit, limit) would fail every call)
     import resource
-    resource.setrlimit(resource.RLIMIT_AS, (maximum_memory_bytes, maximum_memory_bytes))
-    resource.setrlimit(resource.RLIMIT_DATA, (maximum_memory_bytes, maximum_memory_bytes))
-    resource.setrlimit(resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes))
+    for kind in (resource.RLIMIT_AS, resource.RLIMIT_DATA, resource.RLIMIT_STACK):
+        hard = resource.getrlimit(kind)[1]
+        soft = maximum_memory_bytes if hard == resource.RLIM_INFINITY else min(maximum_memory_bytes, hard)
+        resource.setrlimit(kind, (soft, hard))
 faulthandler.disable()
 builtins.exit = None
 builtins.quit = None
