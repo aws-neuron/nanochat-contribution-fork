@@ -20,10 +20,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
-from nanochat.optim import MuonAdamW
+from nanochat.optim import MuonAdamW, DistMuonAdamW
+
+# Accelerator backend (nanochat/backend.py): attention, embedding lookups and the fused lm_head + CE loss. The
+# reference implementation is plain torch (upstream nanochat semantics); AWS Trainium's lives in nanochat/trn and is
+# selected there when a Neuron device is available.
+from nanochat.backend import backend
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
-from nanochat.flash_attention import flash_attn
+# (Trainium substitutes its BTHD-native NKI flash attention for training shapes)
+flash_attn = backend.flash_attn
 
 @dataclass
 class GPTConfig:
@@ -37,6 +43,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Activation checkpointing: recompute each Block's attn / mlp region in the backward instead of keeping its
+    # activations live (two regions per Block, see Block.forward). Default FALSE = upstream (no checkpointing).
+    # On Trainium it is load-bearing -- d24 at MBS>=4 does not fit without it -- so the speedrun turns it on.
+    # A config field rather than an env var so it travels with the model into the checkpoint meta.
+    activation_checkpoint: bool = False
 
 
 def norm(x):
@@ -98,8 +109,10 @@ class CausalSelfAttention(nn.Module):
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        # QK norm before rotary: rotary rotates pairs of dims, so it keeps the per-head L2 norm and
+        # norm(rotary(x)) == rotary(norm(x)). neuronx-cc 2.0.410046 lowers rotary followed by norm about 3x slower.
         q, k = norm(q), norm(k) # QK norm
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
         k = k * 1.2
 
@@ -146,10 +159,32 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.activation_checkpoint = config.activation_checkpoint
+        # Optional torch.utils.checkpoint context_fn: None = plain full recompute. Trainium's compile_model sets one
+        # for FP8 Blocks so the FP8 saved state follows the checkpoint (nanochat.trn.fp8.fp8_recompute_contexts).
+        self.checkpoint_context_fn = None
+
+    def _fwd_attn(self, x, ve, cos_sin, window_size, kv_cache):
+        return self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+
+    def _fwd_mlp(self, x):
+        return self.mlp(norm(x))
+
+    def _checkpoint(self, function, *args):
+        kwargs = {"use_reentrant": False, "preserve_rng_state": False}
+        if self.checkpoint_context_fn is not None:
+            kwargs["context_fn"] = self.checkpoint_context_fn
+        return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        # Two checkpoint regions (attn, then mlp): measurably faster than one region over the whole Block on
+        # Trainium (2164.9 vs 2184.4 ms/step at d24). Training-only: under no_grad there is nothing to recompute.
+        if self.activation_checkpoint and torch.is_grad_enabled():
+            x = x + self._checkpoint(self._fwd_attn, x, ve, cos_sin, window_size, kv_cache)
+            x = x + self._checkpoint(self._fwd_mlp, x)
+        else:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+            x = x + self.mlp(norm(x))
         return x
 
 
@@ -443,15 +478,21 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        # Muon groups (matrix params, grouped by shape for stacking). The optimizer class may define its own group
+        # key (Trainium's DistMuonAdamW groups by SORTED shape so a matrix and its transpose share a group: mlp.c_fc
+        # (4d, d) and mlp.c_proj (d, 4d) fill the ranks of one merged group instead of leaving 40 of 64 ranks idle
+        # each); the member order is the model's parameter order, which rank ownership and checkpoints depend on.
+        ddp, _, _, _ = get_dist_info()
+        optimizer_cls = DistMuonAdamW if ddp else MuonAdamW
+        group_key = getattr(optimizer_cls, "muon_group_key", lambda p: tuple(p.shape))
+        for key in sorted({group_key(p) for p in matrix_params}):
+            group_params = [p for p in matrix_params if group_key(p) == key]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
             ))
 
-        optimizer = MuonAdamW(param_groups)
+        optimizer = optimizer_cls(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
@@ -464,11 +505,20 @@ class GPT(nn.Module):
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        if kv_cache is not None and kv_cache.ragged and T == 1:
+            # Batched decode across problems with different prompt lengths: each row's new token sits at its own
+            # position cache_seqlens[b]. Gather per-row rotary (B, 1, 1, d) instead of a single scalar slice.
+            pos = kv_cache.cache_seqlens.long()  # (B,)
+            cos = self.cos[0, :, 0, :].index_select(0, pos).unsqueeze(1).unsqueeze(1)  # (B,1,1,d)
+            sin = self.sin[0, :, 0, :].index_select(0, pos).unsqueeze(1).unsqueeze(1)
+            cos_sin = cos, sin
+        else:
+            T0 = 0 if kv_cache is None else kv_cache.get_pos()
+            cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
-        # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
+        # Embed the tokens (backend.embedding(idx, weight) == F.embedding(idx, weight); Trainium runs the backward
+        # of wte and the value-embedding tables through one NKI scatter-add kernel with a shared token sort)
+        x = backend.embedding(idx, self.transformer.wte.weight) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
@@ -498,7 +548,7 @@ class GPT(nn.Module):
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            ve = backend.embedding(idx, self.value_embeds[str(i)].weight).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
@@ -509,6 +559,12 @@ class GPT(nn.Module):
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        if targets is not None and loss_reduction == "mean":
+            # Backends may fuse lm_head + softcap + CE for training (Trainium: nanochat/trn/fused_ce.py, one compiled
+            # graph chunked over B*T); None means "compute it here".
+            loss = backend.head_ce_loss(x, self.lm_head.weight, targets, self.config.vocab_size, softcap)
+            if loss is not None:
+                return loss
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation

@@ -31,7 +31,8 @@ import torch
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
-from nanochat.core_eval import evaluate_task
+from nanochat import core_eval
+from nanochat.trn import core_eval as trn_core_eval # Trainium: fixed-shape batched CORE
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -106,7 +107,8 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         if max_per_task > 0:
             data = data[:max_per_task]
 
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        impl = trn_core_eval if device.type == "neuron" else core_eval
+        accuracy = impl.evaluate_task(model, tokenizer, data, device, task_meta)
         results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
@@ -195,6 +197,11 @@ def main():
                 print0("-" * 80)
                 print0(sample_str)
                 unconditioned_samples.append(sample_str)
+
+    # Trainium: compile the batched-CORE (and bpb) forward shapes now, spread across the ranks, instead of one at a time inside the timed loops
+    if device_type == "neuron" and 'core' in eval_modes:
+        trn_core_eval.warmup_core_shapes(model, tokenizer, device,
+                                         bpb_batch=(args.device_batch_size, token_bytes) if 'bpb' in eval_modes else None)
 
     # --- BPB evaluation ---
     if 'bpb' in eval_modes:

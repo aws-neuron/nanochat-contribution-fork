@@ -16,9 +16,11 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized, get_synchronize, get_max_memory_fn
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
+from nanochat.backend import backend
+from nanochat.fp8 import convert_model_to_fp8, disable_fp8
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -36,11 +38,15 @@ parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the m
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps|neuron (empty = autodetect)")
+# FP8 training (same recipe and Linears as base_train --fp8, so SFT reuses the pretrain graphs)
+parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU or Trainium)")
+parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
+parser.add_argument("--save-optimizer", type=int, default=1, help="save the optimizer shards with the SFT checkpoint (0=no, 1=yes)")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes (default: inherit from pretrained checkpoint)
@@ -56,7 +62,7 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 # Evaluation
-parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable, also at the end)")
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
 parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
@@ -73,8 +79,10 @@ device_type = autodetect_device_type() if args.device_type == "" else args.devic
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+synchronize = get_synchronize(device_type)
+get_max_memory = get_max_memory_fn(device_type)
+if device_type == "neuron":
+    from nanochat.trn.engine import NeuronEngine as Engine  # static-shape, bucketed KV caches for on-device generation
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
@@ -114,8 +122,13 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
+# Convert Linear layers to Float8Linear if --fp8 is set (same Linears as base_train: nanochat/fp8.py)
+if args.fp8:
+    args.fp8 = convert_model_to_fp8(model, device_type, args.fp8_recipe)
+
 orig_model = model
-model = torch.compile(model, dynamic=False)
+print0(f"Activation checkpointing: {model.config.activation_checkpoint}")
+model = backend.compile_model(model, fp8=args.fp8, batch_size=args.device_batch_size, seq_len=args.max_seq_len)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -137,7 +150,9 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    # Neuron: stage the shard on the host; load_state_dict then moves one tensor at a time (two device copies of a 6 GB shard do not fit next to the model)
+    load_device = "cpu" if device_type == "neuron" else device
+    optimizer_data = load_optimizer_state("base", load_device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
@@ -145,6 +160,8 @@ if args.load_optimizer:
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
         print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
+        gc.collect()
+        backend.empty_cache(device_type)
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
 
@@ -280,13 +297,13 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         use_cuda = device_type == "cuda"
         batch_tensor = torch.tensor(rows, dtype=torch.long, pin_memory=use_cuda)
         inputs = batch_tensor[:, :-1].to(device=device, dtype=torch.int32, non_blocking=use_cuda).contiguous()
-        targets = batch_tensor[:, 1:].to(device=device, dtype=torch.int64, non_blocking=use_cuda).contiguous()
+        targets = batch_tensor[:, 1:].clone() # masked on the host below (a masked scatter is a shape-varying op on Neuron: one compile per step)
 
         # Apply the loss mask from render_conversation (mask=1 for assistant completions,
         # mask=0 for user prompts, BOS, special tokens, tool outputs). mask[1:] aligns
         # with targets (shifted by 1). Unmasked positions get -1 (ignore_index).
         mask_tensor = torch.tensor(mask_rows, dtype=torch.int8)
-        mask_targets = mask_tensor[:, 1:].to(device=device)
+        mask_targets = mask_tensor[:, 1:]
         targets[mask_targets == 0] = -1
 
         # Mask out padding positions in targets (set to -1 = ignore_index)
@@ -294,6 +311,7 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
         for i, content_len in enumerate(row_lengths):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
+        targets = targets.to(device=device, non_blocking=use_cuda).contiguous()
 
         yield inputs, targets
 
@@ -323,6 +341,7 @@ def get_muon_momentum(it):
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
 min_val_bpb = float("inf")
+val_bpb = float("nan") # stays NaN when --eval-every=-1 (recorded in the checkpoint meta)
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
@@ -336,12 +355,13 @@ while True:
         dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
         last_step = bool(last_step_tensor.item())
 
-    # once in a while: evaluate the val bpb (all ranks participate)
-    if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
+    # once in a while: evaluate the val bpb (all ranks participate); -1 disables it, including at the last step
+    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        with disable_fp8(model):
+            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -369,8 +389,9 @@ while True:
         for task_name in all_tasks:
             limit = args.chatcore_max_cat if task_name in categorical_tasks else args.chatcore_max_sample
             max_problems = None if limit < 0 else limit  # -1 means no limit
-            acc = run_chat_eval(task_name, orig_model, tokenizer, engine,
-                                batch_size=args.device_batch_size, max_problems=max_problems)
+            with disable_fp8(orig_model):
+                acc = run_chat_eval(task_name, orig_model, tokenizer, engine,
+                                    batch_size=args.device_batch_size, max_problems=max_problems)
             task_results[task_name] = acc
             print0(f"  {task_name}: {100*acc:.2f}%")
         # Compute ChatCORE metrics (mean centered accuracy, ranges from 0=random to 1=perfect)
@@ -396,7 +417,7 @@ while True:
             checkpoint_dir,
             step,
             orig_model.state_dict(),
-            optimizer.state_dict(),
+            optimizer.state_dict() if args.save_optimizer else None,
             {
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step

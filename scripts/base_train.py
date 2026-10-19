@@ -19,15 +19,15 @@ import time
 import math
 import argparse
 from dataclasses import asdict
-from contextlib import contextmanager
 
 import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig
+from nanochat.backend import backend
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized, get_synchronize, get_max_memory_fn
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -42,9 +42,9 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps|neuron (empty = autodetect)")
 # FP8 training
-parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
+parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU or Trainium)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
@@ -52,6 +52,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--activation-checkpoint", type=int, default=0, help="checkpoint each Block's attn and mlp region (1=on); trades activation memory for recompute (see GPTConfig)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -85,14 +86,14 @@ user_config = vars(args).copy()  # for logging
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+synchronize = get_synchronize(device_type)
+get_max_memory = get_max_memory_fn(device_type)
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
 else:
-    gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
+    gpu_peak_flops = backend.peak_flops(device_type)  # Trainium: per-rank peak (prints it); inf for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
@@ -137,6 +138,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        activation_checkpoint=bool(args.activation_checkpoint),
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -147,8 +149,7 @@ model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtyp
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # 3) All tensors get initialized
+backend.materialize(model, device) # 2) storage on the target device, 3) init_weights (Trainium: on CPU, then move)
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -164,86 +165,18 @@ if resuming:
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
 
-# Convert Linear layers to Float8Linear if --fp8 is set
+# Convert Linear layers to Float8Linear if --fp8 is set (shared with chat_sft.py: nanochat/fp8.py)
+from nanochat.fp8 import convert_model_to_fp8, disable_fp8
 if args.fp8:
-    if device_type != "cuda":
-        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
-    else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-        import torch.nn as nn
-
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
-        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
-            if not isinstance(mod, nn.Linear):
-                return False
-            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
-                return False
-            if min(mod.in_features, mod.out_features) < 128:
-                return False
-            return True
-
-        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
-
-# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
-@contextmanager
-def disable_fp8(model):
-    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
-
-    CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
-    we swap out Float8Linear modules entirely and restore them after.
-    """
-    import torch.nn as nn
-
-    # Find all Float8Linear modules and their locations
-    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
-    for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__:
-            if '.' in name:
-                parent_name, attr_name = name.rsplit('.', 1)
-                parent = model.get_submodule(parent_name)
-            else:
-                parent = model
-                attr_name = name
-            fp8_locations.append((parent, attr_name, module))
-
-    if not fp8_locations:
-        yield  # No FP8 modules, nothing to do
-        return
-
-    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
-    # Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
-    for parent, attr_name, fp8_module in fp8_locations:
-        linear = Linear(
-            fp8_module.in_features,
-            fp8_module.out_features,
-            bias=fp8_module.bias is not None,
-            device="meta",  # Use meta device to avoid unnecessary VRAM allocation
-            dtype=fp8_module.weight.dtype,
-        )
-        linear.weight = fp8_module.weight  # share, don't copy
-        if fp8_module.bias is not None:
-            linear.bias = fp8_module.bias
-        setattr(parent, attr_name, linear)
-
-    try:
-        yield
-    finally:
-        # Restore Float8Linear modules
-        for parent, attr_name, fp8_module in fp8_locations:
-            setattr(parent, attr_name, fp8_module)
+    args.fp8 = convert_model_to_fp8(model, device_type, args.fp8_recipe)
 
 # -----------------------------------------------------------------------------
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+print0(f"Activation checkpointing: {model_config.activation_checkpoint}")
+# upstream: torch.compile(model, dynamic=False). Trainium: one compiled graph per Block + NKI kernel prewarm for the training shape
+model = backend.compile_model(model, fp8=args.fp8, batch_size=args.device_batch_size, seq_len=args.max_seq_len)
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -412,6 +345,9 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# Trainium fetches the last micro-batch after the optimizer launches (its host->device copy synchronizes the stream)
+prefetch_after_step = backend.prefetch_after_optimizer_step(device_type)
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -515,7 +451,8 @@ while True:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if micro_step < grad_accum_steps - 1 or not prefetch_after_step:
+            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -537,6 +474,8 @@ while True:
         scaler.update()
     else:
         optimizer.step()
+    if prefetch_after_step:
+        x, y, dataloader_state_dict = next(train_loader) # deferred prefetch (see prefetch_after_step above)
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
