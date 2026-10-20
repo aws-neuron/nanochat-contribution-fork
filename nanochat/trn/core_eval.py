@@ -5,7 +5,7 @@ row to the longest row of that example. On Neuron the forward runs op-by-op in e
 rank, and every distinct batch shape compiles its own kernels (~4 min per forward shape with a cold cache), so that
 path took 44 min at 16 ranks for the 22 tasks. Here every rank
 renders and tokenizes its examples up front, sorts the rows into two sequence-length BUCKETS (1024 and the model's
-sequence_len 2048), and forwards fixed batches of TOKENS_PER_BATCH = 16384 tokens per bucket ((16, 1024) and (8, 2048));
+sequence_len 2048), and forwards fixed batches of TOKENS_PER_BATCH = 8192 tokens per bucket ((8, 1024) and (4, 2048));
 dummy BOS rows fill the tail of a bucket. Causal attention makes real rows independent of what follows them, so the
 per-row math is the upstream math: MC / schema rows are scored from the model's per-position cross-entropy
 (loss_reduction='none'), LM rows from the fp32 logits at the continuation positions with the argmax on the CPU (same
@@ -30,7 +30,12 @@ import torch.distributed as dist
 from nanochat.core_eval import (render_prompts_mc, render_prompts_schema, render_prompts_lm,
                                 batch_sequences_mc, batch_sequences_schema, batch_sequences_lm)
 
-TOKENS_PER_BATCH = 16384      # rows per batch = TOKENS_PER_BATCH // bucket: (16, 1024) and (8, 2048)
+# rows per batch = TOKENS_PER_BATCH // bucket: (8, 1024) and (4, 2048). The eager forward materializes the
+# (rows, T, vocab) fp32 logits and their softcap / cross-entropy temporaries, about 3 x 1 GiB per forward at 8192
+# tokens (peak 9 GB per LNC2 rank with the 2.9 GB of weights). At 16384 the allocator held ~19-21 GB of the rank's
+# 24 GB, and NRT could not load the next NEFF (its scratchpad grows to 2.4 GB for these shapes): "Failed to stage graph
+# to NeuronCore" / NRT_RESOURCE in nrt_load_util during the warm-up.
+TOKENS_PER_BATCH = 8192
 BUCKETS = (1024, 2048)        # the model's sequence_len is always the last bucket
 LM_GATHER = 64                # continuation positions gathered per LM row (>= the longest CORE continuation, 49)
 
