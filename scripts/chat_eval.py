@@ -89,6 +89,8 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 # A lot easier because we don't have to sample. Therefore, we can actually go
 # batches at a time and just check the logits for correct answer choices.
 
+CATEGORICAL_TOKENS = 4096 # Trainium: max tokens per categorical forward (see run_categorical_eval)
+
 def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=None):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
@@ -104,9 +106,14 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     # shape, batch_size rows x its longest prompt rounded up to a multiple of 128 (right padding of a causal model cannot
     # change the answer-position logits; the padding rows are never read)
     pad_to = None
+    rows = batch_size  # rows per forward
     if device.type == "neuron":
         my_problems = [ii for i in range(ddp_rank, num_batches, ddp_world_size) for ii in range(i * batch_size, min((i + 1) * batch_size, num_problems))]
         pad_to = ceil_div(max((len(tokenizer.render_for_completion(task_object[ii])) for ii in my_problems), default=1), 128) * 128
+        # The forward materializes (rows, pad_to, vocab) fp32 logits plus their softcap copies: at MMLU's pad_to of up to
+        # 1024 and 8 rows that is 1 GiB per copy, which does not fit next to the weights on a 12 GiB LNC1 core. Forward
+        # at most CATEGORICAL_TOKENS tokens at a time (still one shape per rank: the batch is padded to a multiple of rows).
+        rows = max(1, min(batch_size, CATEGORICAL_TOKENS // pad_to))
 
     # Run the evaluation
     letter_to_id_cache = {} # many letters will repeat often, let's save the tokenizer some work
@@ -121,12 +128,14 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
         padded_prompt_ids = [ids + [bos] * (max_length - len(ids)) for ids in prompt_ids]
         if pad_to is not None:
-            padded_prompt_ids += [[bos] * max_length] * (batch_size - len(padded_prompt_ids)) # padding rows, ignored below
+            padded_prompt_ids += [[bos] * max_length] * (ceil_div(batch_size, rows) * rows - len(padded_prompt_ids)) # padding rows, ignored below
         prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
+        positions = torch.tensor(answer_time_positions + [0] * (len(padded_prompt_ids) - len(answer_time_positions)), dtype=torch.long, device=device)
 
-        # Get the logits for the whole batch of conversations in parallel (efficiency win here)
+        # Get the logits at the answer positions for the whole batch of conversations, `rows` conversations per forward
         with torch.no_grad():
-            logits = model(prompt_ids) # (B, T, V)
+            logits = torch.cat([model(ids)[torch.arange(ids.size(0), device=device), pos]
+                                for ids, pos in zip(prompt_ids.split(rows), positions.split(rows))]) # (B, V)
 
         # Focus on the available answer on just the letters corresponding to choices
         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
@@ -143,8 +152,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
                     letter_to_id_cache[letter] = encoded_letter[0]
                 letter_ids.append(letter_to_id_cache[letter])
             # focus logits just down to the answer position and the available letters of the answer
-            answer_pos = answer_time_positions[idx]
-            focus_logits = logits[idx, answer_pos, letter_ids]
+            focus_logits = logits[idx, letter_ids]
             # get the argmax letter (the predicted answer)
             argmax_letter_id = focus_logits.argmax(dim=-1).item()
             predicted_letter = letters[argmax_letter_id]
