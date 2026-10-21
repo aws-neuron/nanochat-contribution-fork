@@ -89,8 +89,8 @@ def build_model(checkpoint_dir, step, device, phase):
             k: v.float() if v.dtype == torch.bfloat16 else v
             for k, v in model_data.items()
         }
-    # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
-    model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
+    # Hack: fix torch compile issue, which prepends all keys with _orig_mod. (per-Block compile puts it mid-key)
+    model_data = {k.replace("_orig_mod.", ""): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
@@ -100,7 +100,9 @@ def build_model(checkpoint_dir, step, device, phase):
         model = GPT(model_config)
     # Load the model state
     model.to_empty(device=device)
-    model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    # note: the load below overwrites everything but the non-persistent rotary buffers, so init just those (on Neuron
+    # init_weights() is ~50 eager ops that each compile their own kernel on a cold cache: ~50 s per stage start)
+    model.cos, model.sin = model._precompute_rotary_embeddings(model.rotary_seq_len, model_config.n_embd // model_config.n_head)
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":

@@ -111,6 +111,15 @@ The important thing to note is that nanochat is written and configured around on
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
 
+## Running on AWS Trainium
+
+nanochat also trains and evaluates on AWS Trainium through `torch_neuronx`. The Trainium code lives in [nanochat/trn/](nanochat/trn/) (per-Block `torch.compile`, the optimizer and the static-shape evaluation engines). The model and the scripts reach it only through the small backend hook in [nanochat/backend.py](nanochat/backend.py). Off Trainium, nanochat runs the upstream code paths.
+
+```bash
+# Activate the Neuron SDK venv (neuronx-cc on PATH), then run the Trainium counterpart of runs/speedrun.sh:
+bash runs/speedrun_trn.sh
+```
+
 ## Precision / dtype
 
 nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
@@ -120,6 +129,7 @@ nanochat does not use `torch.amp.autocast`. Instead, precision is managed explic
 | CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
 | CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
 | CPU / MPS | `float32` | Safe default. On recent macOS, MPS also runs `NANOCHAT_DTYPE=bfloat16` fine (~25% less memory, similar speed) |
+| AWS Trainium (Neuron) | `bfloat16` | Native bf16 on NeuronCore; the transformer blocks also keep bf16 parameters (fp32 master shards live in the optimizer) |
 
 You can override the default with the `NANOCHAT_DTYPE` environment variable:
 
@@ -152,6 +162,7 @@ I've published a number of guides that might contain helpful information, most r
 │   └── repackage_data_reference.py # Pretraining data shard generation
 ├── nanochat
 │   ├── __init__.py                 # empty
+│   ├── backend.py                  # Accelerator backend hook (torch reference; nanochat/trn implements it)
 │   ├── checkpoint_manager.py       # Save/Load model checkpoints
 │   ├── common.py                   # Misc small utilities, quality of life
 │   ├── core_eval.py                # Evaluates base model CORE score (DCLM paper)
@@ -162,13 +173,15 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── gpt.py                      # The GPT nn.Module Transformer
 │   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
 │   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
-│   └── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
+│   ├── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
+│   └── trn/                        # AWS Trainium backend: compile, optimizer, eval engines
 ├── pyproject.toml
 ├── runs
 │   ├── miniseries.sh               # Miniseries training script
 │   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
 │   ├── scaling_laws.sh             # Scaling laws experiments
-│   └── speedrun.sh                 # Train the ~$100 nanochat d20
+│   ├── speedrun.sh                 # Train the ~$100 nanochat d20
+│   └── speedrun_trn.sh             # The speedrun on AWS Trainium
 ├── scripts
 │   ├── base_eval.py                # Base model: CORE score, bits per byte, samples
 │   ├── base_train.py               # Base model: train

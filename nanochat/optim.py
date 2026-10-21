@@ -457,3 +457,13 @@ class MuonAdamW(torch.optim.Optimizer):
 
         # Phase 3: wait for gathers, copy back
         self._finish_gathers(gather_list)
+
+# -----------------------------------------------------------------------------
+# AWS Trainium: the distributed optimizer is nanochat/trn/optim.py's DistMuonAdamW (bf16 block params with fp32
+# master shards in the optimizer state, merged transposed-shape Muon groups, the fused 6-launch step). Elsewhere the
+# MuonAdamW above covers single and multi rank, so `from nanochat.optim import DistMuonAdamW` is the right
+# distributed optimizer on every backend.
+from nanochat.backend import backend
+DistMuonAdamW = MuonAdamW
+if backend.name == "neuron":
+    from nanochat.trn.optim import DistMuonAdamW  # noqa: F401, F811  (replaces the reference class above on Trainium)

@@ -1,4 +1,17 @@
-"""nanochat.trn -- the AWS Trainium (Neuron) backend: everything Neuron-specific lives here.
+"""nanochat.trn -- the AWS Trainium (Neuron) backend.
+
+Everything Neuron-specific lives here. The upstream modules reach it through the hooks in nanochat/backend.py
+(model, optimizer, training scripts) and a few device checks (nanochat/common.py; scripts/base_eval.py,
+chat_eval.py and chat_sft.py pick trn/core_eval.py and trn/engine.py on a Neuron device).
+
+  trn/__init__.py     is_available(), get_backend() and the small runtime shims nanochat/common.py needs
+  trn/backend.py      NeuronBackend: the nanochat.backend hooks
+  trn/attention.py    the Neuron flash_attn_func / flash_attn_with_kvcache
+  trn/compile.py      per-Block torch.compile
+  trn/fused_ce.py     fused lm_head + softcap + CE (one compiled graph)
+  trn/optim.py        DistMuonAdamW: fp32 master shards and the fused 6-launch step
+  trn/core_eval.py    fixed-shape batched CORE evaluation
+  trn/engine.py       NeuronEngine: static-shape, bucketed KV caches and batched decode
 
 This module must stay import-light (torch only): nanochat.common imports it at import time.
 """
@@ -47,3 +60,15 @@ def max_memory_allocated() -> int:
 def empty_cache():
     import torch_neuronx
     torch_neuronx.empty_cache()
+
+
+_backend = None
+
+
+def get_backend():
+    """The NeuronBackend singleton (nanochat.backend selects it when is_available())."""
+    global _backend
+    if _backend is None:
+        from nanochat.trn.backend import NeuronBackend
+        _backend = NeuronBackend()
+    return _backend

@@ -88,6 +88,7 @@ class KVCache:
     - FA3 updates the cache in-place during flash_attn_with_kvcache
     - Position tracked per batch element via cache_seqlens tensor
     """
+    ragged = False # rows at different positions (nanochat/trn/engine.py batched decode): GPT.forward gathers per-row rotary
 
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
         self.batch_size = batch_size
