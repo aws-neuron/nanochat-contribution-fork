@@ -113,7 +113,7 @@ The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of runni
 
 ## Running on AWS Trainium
 
-nanochat also trains and evaluates on AWS Trainium through `torch_neuronx`. The Trainium code lives in [nanochat/trn/](nanochat/trn/) (per-Block `torch.compile`, the optimizer and the static-shape evaluation engines). The model and the scripts reach it only through the small backend hook in [nanochat/backend.py](nanochat/backend.py). Off Trainium, nanochat runs the upstream code paths.
+nanochat also trains and evaluates on AWS Trainium through `torch_neuronx`. The Trainium code lives in [nanochat/trn/](nanochat/trn/) (the NKI attention kernel, per-Block `torch.compile`, the optimizer and the static-shape evaluation engines). The model and the scripts reach it only through the small backend hook in [nanochat/backend.py](nanochat/backend.py). Off Trainium, nanochat runs the upstream code paths.
 
 ```bash
 # Activate the Neuron SDK venv (neuronx-cc on PATH), then run the Trainium counterpart of runs/speedrun.sh:
@@ -174,7 +174,7 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
 │   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
 │   ├── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
-│   └── trn/                        # AWS Trainium backend: compile, optimizer, eval engines
+│   └── trn/                        # AWS Trainium backend: NKI attention, compile, optimizer, eval engines
 ├── pyproject.toml
 ├── runs
 │   ├── miniseries.sh               # Miniseries training script

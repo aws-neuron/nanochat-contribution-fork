@@ -1,10 +1,20 @@
-"""Neuron attention for nanochat. Two pieces:
+"""Neuron attention for nanochat. Three pieces:
 
-1. nkilib sliding-window attention for the SDPA path's S-layers ((B,H,T,D) layout, attention_cte /
+1. BTHD-native flash attention (the training path). BOTH forward and backward consume/produce native (B,T,H,D) --
+   no q/k/v/o/dy/grad relayout anywhere. fwd = bthd_flash_fwd(return_lse=True), bwd = bthd_flash_bwd
+   (nanochat/trn/kernels/attention_bthd.py). Taken whenever the shapes allow AND gradients are being
+   recorded: MHA (H_kv == H), sliding_window in {0, 512} (nanochat's L-layers map to 0 = full causal, S-layers to
+   512 = keys i-512 <= j <= i, flash-attention's window_size=(512, 0)), Q packed in 16 tiles of 128 tokens
+   (T % 2048 == 0). The no-grad forwards of the eval stages (base_eval's CORE buckets and bpb batches, whose
+   (8, 2048) shape equals the training shape) keep the SDPA path so the reported eval numbers are those of the SDPA
+   reference (the BTHD forward's rounding would move CORE by ~1e-3); decode uses the kv-cache path, which the kernel
+   does not implement.
+
+2. nkilib sliding-window attention for the SDPA fallback's S-layers ((B,H,T,D) layout, attention_cte /
    attention_bwd with their native `sliding_window`): avoids materializing the T x T score matrix that SDPA + an
    explicit attn_mask would produce on Neuron (SDPA with an explicit mask does not take the fused flash-attention path).
 
-2. The Neuron flavour of nanochat.flash_attention's public API: flash_attn_func (SDPA with
+3. The Neuron flavour of nanochat.flash_attention's public API: flash_attn_func (BTHD kernel, else SDPA with
    contiguous (B,H,T,D) inputs -- strided views fall off the fused kernel path) and flash_attn_with_kvcache
    (static-shape single-token decode over the whole pre-allocated cache, slice-based prefill). Non-Neuron tensors
    are handed to the torch reference implementation unchanged.
@@ -138,6 +148,99 @@ def nki_flash_attn_swa(q, k, v, window_size):
 
 
 # ---------------------------------------------------------------------------------------------------------
+# BTHD-native flash attention (training fast path)
+# ---------------------------------------------------------------------------------------------------------
+BTHD_NKI_AVAILABLE = False
+try:
+    from nanochat.trn.kernels.attention_bthd import bthd_flash_fwd, bthd_flash_bwd
+    from torch_neuronx.nki_hop import wrap_nki
+    from torch_neuronx.utils import get_logical_neuron_cores
+
+    _bthd_wrapped_fwd = wrap_nki(bthd_flash_fwd)
+    _bthd_wrapped_bwd = wrap_nki(bthd_flash_bwd)
+    BTHD_NKI_AVAILABLE = True
+except ImportError:
+    pass
+
+
+@torch._dynamo.allow_in_graph
+class _BTHDFlashAttn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, softmax_scale, sliding_window):
+        """
+        q, k, v: (B, T, H, D) bf16 — NATIVE layout, NOT pre-scaled.
+                 MHA only (H_kv == H). softmax_scale passed to the kernel.
+        Returns: output (B, T, H, D)
+        """
+        lnc = int(get_logical_neuron_cores())
+        grid = (lnc,)
+
+        # NATIVE BTHD — no reshape, no transpose, NO pre-scale buffer. Passing
+        # softmax_scale to the kernel (vs q*scale) avoids a 24MiB/layer copy
+        # that would also be saved for backward.
+        out, lse = _bthd_wrapped_fwd[grid](
+            q, k, v,
+            softmax_scale=softmax_scale,
+            causal=True,
+            sliding_window=sliding_window,
+            return_lse=True,
+        )
+        # Save exactly the 5 tensors backward needs (references, not copies).
+        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.softmax_scale = softmax_scale
+        ctx.sliding_window = sliding_window
+        ctx.grid = grid
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        q, k, v, out, lse = ctx.saved_tensors
+        grid = ctx.grid
+
+        # NATIVE BTHD backward — q,k,v,o,dy,lse all native; dq,dk,dv native out.
+        # dy must be contiguous BTHD for the kernel's .ap strides.
+        dq, dk, dv = _bthd_wrapped_bwd[grid](
+            q, k, v, out, grad_output.contiguous(), lse,
+            softmax_scale=ctx.softmax_scale,
+            causal=True,
+            sliding_window=ctx.sliding_window,
+        )
+        return dq, dk, dv, None, None
+
+
+def bthd_flash_attn_swa(q, k, v, window_size):
+    """Native-BTHD flash attention with sliding window via NKI kernels.
+
+    Args:
+        q, k, v: (B, T, H, D) bf16 — NATIVE layout (no pre-transpose needed).
+                 nanochat already applies its q*1.2/k*1.2 upstream; here we pass
+                 the 1/sqrt(D) softmax scale to the kernel (no extra buffer).
+        window_size: int, past tokens to attend to besides the current one. 0 => full causal;
+                     512 => keys i-512 <= j <= i (513 keys). (caller maps -1/full -> 0.)
+    Returns:
+        output: (B, T, H, D)
+    """
+    if not BTHD_NKI_AVAILABLE:
+        raise RuntimeError("BTHD NKI attention requires Neuron + nanochat.trn.kernels.attention_bthd "
+                           "+ torch_neuronx.nki_hop")
+    D = q.shape[-1]
+    scale = 1.0 / math.sqrt(D)
+    return _BTHDFlashAttn.apply(q, k, v, scale, window_size)
+
+
+def bthd_window(window_size, T):
+    """Map nanochat's (left, right) window to the kernel's sliding_window: 0 = full causal, 512 = SWA, None = unsupported.
+
+    The kernel's sliding_window is the left window of flash-attention's window_size: keys i - left <= j <= i."""
+    left = window_size[0]
+    if left < 0 or left >= T:
+        return 0
+    if left == 512:
+        return 512
+    return None
+
+
+# ---------------------------------------------------------------------------------------------------------
 # Public API (same signatures as nanochat.flash_attention)
 # ---------------------------------------------------------------------------------------------------------
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
@@ -154,11 +257,19 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     return _ref._sdpa_attention(q, k, v, window_size, enable_gqa)
 
 
+def bthd_supported(q, k, window_size):
+    """Shape rule of the BTHD kernel: MHA, T % 2048 == 0, window in {full, 512} (see module docstring, item 1)."""
+    return (BTHD_NKI_AVAILABLE and q.size(2) == k.size(2) and q.size(1) % 2048 == 0
+            and bthd_window(window_size, q.size(1)) is not None)
+
+
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
-    """Attention on (B, T, H, D): SDPA with contiguous (B, H, T, D) operands. Non-Neuron tensors go to the torch
-    reference."""
+    """Attention on (B, T, H, D): the BTHD NKI kernel for training (gradients recorded, supported shapes), else SDPA
+    with contiguous (B, H, T, D) operands. Non-Neuron tensors go to the torch reference."""
     if _ref.USE_FA3 or q.device.type != "neuron":
         return _ref.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    if torch.is_grad_enabled() and bthd_supported(q, k, window_size):
+        return bthd_flash_attn_swa(q, k, v, bthd_window(window_size, q.size(1)))
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D). Neuron needs contiguous inputs (strided views fall
     # off the fused kernel path).
     q = q.transpose(1, 2).contiguous()
