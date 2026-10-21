@@ -38,6 +38,7 @@ try:
     import nki
     import nki.isa as nisa
     import nki.language as nl
+    from nki.compiler import CompileConfig
     _NKI_OK = True
 except ImportError:  # pragma: no cover  (non-Neuron host)
     pass
@@ -60,7 +61,8 @@ if _NKI_OK:
             cw = min(N_TILE, D - c0)
             nisa.nc_matmul(dst=ps[:, c0:c0 + cw], stationary=oh, moving=mv[:, c0:c0 + cw], accumulate=False)
 
-    @nki.jit
+    # Opt in to non-SSA legalization (off by default for NKI kernels): 0.943 -> 0.890 ms at d24.
+    @nki.jit(compile_config=CompileConfig(non_ssa_legalization=True))
     def embedding_backward_sorted_v5(grad, perm_T, tA, tile_info, perm_B, tB, dest_B, fix_info, num_weights: int):
         """grad (N, D) bf16 contiguous. perm_T (128, n_tiles) int32: grad row of (partition p, sorted tile j).
         tA (128, 2*n_tiles) fp32: id - 128*v for slot 0 (v = vlo_j) and slot 1 (v = vhi_j, or -1 = pass-through).
