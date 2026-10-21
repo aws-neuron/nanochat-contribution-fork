@@ -16,6 +16,7 @@ section.
 import nki
 import nki.isa as nisa
 import nki.language as nl
+from nki.compiler import CompileConfig
 from nki.isa import engine
 
 
@@ -119,7 +120,7 @@ _V7_PIN_TSCR = False
 _V7_PIN_EXP = False
 _V7_PIN_NORM = False
 _V7_PIN_COPIES = False
-_V7_VCHAIN = True
+_V7_VCHAIN = True  # as schedule-only edges: same-engine order for the scheduler, no semaphore wait
 _V7_SCHAIN = True
 _V7_TCHAIN = False
 _V7_PVANCH = True
@@ -492,9 +493,9 @@ def _qk_reduce_group(
             reduce_cmd=nisa.reduce_cmd.reset_reduce if chunk_index == 0 else nisa.reduce_cmd.reduce,
         )
         if chunk_index == 0 and pin_first:
-            h.depends_on(pin_inst)
+            h.depends_on(pin_inst, kind=nisa.dependency.schedule)
         if chunk_index > 0 and _V7_VCHAIN:
-            h.depends_on(last)
+            h.depends_on(last, kind=nisa.dependency.schedule)
         last = h
     return last
 
@@ -692,9 +693,9 @@ def _pe_transpose_group(
         )
         if copy_engine == "v":
             if have_v and _V7_VCHAIN:
-                h.depends_on(last_v)
+                h.depends_on(last_v, kind=nisa.dependency.schedule)
             if (not have_v) and pin_v:
-                h.depends_on(pin_v_inst)
+                h.depends_on(pin_v_inst, kind=nisa.dependency.schedule)
             last_v = h
             have_v = True
         else:
@@ -1710,7 +1711,7 @@ def bthd_flash_fwd(
                                     data=set_section_sum[rc_set % 2][rc_h][:, nl.ds(rc_group, recip_batch)],
                                 )
                             if _V7_VCHAIN and have_vec:
-                                h_rec.depends_on(last_vec)
+                                h_rec.depends_on(last_vec, kind=nisa.dependency.schedule)
                             elif _V7_PIN_RECIP and have_anchor:
                                 h_rec.depends_on(anchor)
                             last_vec = h_rec
@@ -1740,7 +1741,7 @@ def bthd_flash_fwd(
                             engine=engine.vector,
                         )
                         if _V7_VCHAIN and have_vec:
-                            h_norm.depends_on(last_vec)
+                            h_norm.depends_on(last_vec, kind=nisa.dependency.schedule)
                         elif _V7_PIN_NORM and have_anchor:
                             h_norm.depends_on(anchor)
                         last_vec = h_norm
@@ -2098,7 +2099,7 @@ def bthd_flash_fwd(
                                     data=set_section_sum[rc_set % 2][rc_h][:, nl.ds(rc_group, recip_batch)],
                                 )
                             if _V7_VCHAIN and have_vec:
-                                h_rec.depends_on(last_vec)
+                                h_rec.depends_on(last_vec, kind=nisa.dependency.schedule)
                             elif _V7_PIN_RECIP and have_anchor:
                                 h_rec.depends_on(anchor)
                             last_vec = h_rec
@@ -2128,7 +2129,7 @@ def bthd_flash_fwd(
                             engine=engine.vector,
                         )
                         if _V7_VCHAIN and have_vec:
-                            h_norm.depends_on(last_vec)
+                            h_norm.depends_on(last_vec, kind=nisa.dependency.schedule)
                         elif _V7_PIN_NORM and have_anchor:
                             h_norm.depends_on(anchor)
                         last_vec = h_norm
@@ -3078,7 +3079,8 @@ def _bwd_step_dq(
     return stage_slot
 
 
-@nki.jit
+# Opt in to non-SSA legalization (off by default for NKI kernels): causal 3.81 -> 3.38 ms at d24.
+@nki.jit(compile_config=CompileConfig(non_ssa_legalization=True))
 def bthd_flash_bwd(
     q: nl.ndarray,
     k: nl.ndarray,
