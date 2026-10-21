@@ -7,6 +7,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 import torch
+from nki.compiler import CompileConfig
 from nki.isa import matmul_perf_mode
 
 from nanochat.trn.kernels.fp8_common import (
@@ -23,7 +24,8 @@ from nanochat.trn.kernels.fp8_common import (
 )
 
 
-@nki.jit
+# Opt in to non-SSA legalization (off by default for NKI kernels): c_proj 3.81 -> 2.46 ms at d24.
+@nki.jit(compile_config=CompileConfig(non_ssa_legalization=True))
 def tensorwise_fp8_gemm(
     a,
     b,
@@ -914,13 +916,13 @@ def _fwd_load_kmajor_tile(input_2d, row_start: int, a_raw, K: int, k_tiles: int,
         )
 
 
-def _fwd_prefetch_tiles(input_2d, raw_ring, a_raw_ring, prefetch_tiles: int, grid, program_id, K: int, k_tiles: int, tp_group: int, first_kmajor: int = 0):
+def _fwd_prefetch_tiles(input_2d, raw_ring, a_raw_ring, prefetch_tiles: int, grid, program_id, K: int, k_tiles: int, tp_group: int, first_kmajor: int = 0, load_raw: bool = True):
     """Issue the remaining loads of the first tiles (tile 0's row-major load was issued earlier; the
     K-major transposes of tiles < first_kmajor were issued at the start of the prologue). ``raw_ring`` /
     ``a_raw_ring`` are indexed by tile position."""
     for t in nl.static_range(prefetch_tiles):
         row_start = (t * grid + program_id) * P_MAX
-        if t > 0:
+        if t > 0 and load_raw:
             nisa.dma_copy(dst=raw_ring[t], src=input_2d[row_start:row_start + P_MAX, 0:K], dge_mode=FWD_RAW_DGE, engine=FWD_RAW_ENGINE)
         if t < first_kmajor:
             continue
@@ -1042,16 +1044,16 @@ def _fwd_pipe_step(
     input_2d, out, saved_e4m3, b_fp8, a_qscale, output_scale, grid, program_id,
     t, s: int, has_next: bool, next_preloaded: bool, t_next, s_next: int,
     raw_ring, quant_ring, a_raw_ring, a_fp8_ring, res_ring, K: int, k_tiles: int, tp_group: int, n_groups: int, nstep: int,
-    save_scale=None,
+    save_scale=None, save: bool = True,
 ):
     """One software-pipelined step of the row-split main loop: stage 1 of local tile ``t_next`` (slot
     ``s_next``), then stage 2 of local tile ``t`` (slot ``s``)."""
     if has_next:
         # (first step: the next tile's K-major quantize also uses the head-chunk-dependent scale copy)
         _fwd_tile_prepare(input_2d, (a_qscale if save_scale is None else save_scale), t_next * grid + program_id,
-                          raw_ring[s_next], a_raw_ring[s_next], a_fp8_ring[s_next], K, k_tiles, tp_group, next_preloaded, True)
+                          raw_ring[s_next], a_raw_ring[s_next], a_fp8_ring[s_next], K, k_tiles, tp_group, next_preloaded, save)
     _fwd_tile_compute(input_2d, out, saved_e4m3, b_fp8, a_qscale, output_scale, t * grid + program_id,
-                      raw_ring[s], quant_ring[s], a_fp8_ring[s], res_ring[s], K, n_groups, nstep, True, save_scale)
+                      raw_ring[s], quant_ring[s], a_fp8_ring[s], res_ring[s], K, n_groups, nstep, save, save_scale)
 
 
 def _fwd_row_tile(
@@ -1110,6 +1112,19 @@ def _fwd_row_tile(
 
 @nki.jit
 def tensorwise_fp8_forward_save_v1(input_2d, weight, nstep: int):
+    """Fused training forward: see ``_forward_save_impl``."""
+    return _forward_save_impl(input_2d, weight, nstep, True)
+
+
+@nki.jit
+def tensorwise_fp8_forward_nosave_v1(input_2d, weight, nstep: int):
+    """``tensorwise_fp8_forward_save_v1`` without the E4M3 save (row split, M >= 4N, only): the same
+    BF16 ``out`` alone, without the row-major activation loads, the save quantize and the byte stores.
+    For c_proj, whose saved bytes come from ``tensorwise_e4m3_save``."""
+    return _forward_save_impl(input_2d, weight, nstep, False)
+
+
+def _forward_save_impl(input_2d, weight, nstep: int, save: bool):
     """Fused training forward: save native E4M3 input bytes and compute BF16 ``input @ weight.T``.
 
     Semantics are identical to ``tensorwise_e4m3_save`` followed by ``tensorwise_fp8_gemm``
@@ -1151,7 +1166,8 @@ def tensorwise_fp8_forward_save_v1(input_2d, weight, nstep: int):
         nstep: Number of adjacent 512-column output tiles grouped per PSUM accumulator.
 
     Returns:
-        (BF16 [M, N] output, uint8 [M, K] E4M3 bytes, FP32 [2, 128, 1] replicated inverse scale).
+        (BF16 [M, N] output, uint8 [M, K] E4M3 bytes, FP32 [2, 128, 1] replicated inverse scale), or the
+        output alone if not ``save``.
     """
     kernel_assert(len(input_2d.shape) == 2, "input must be rank 2")
     kernel_assert(len(weight.shape) == 2, "weight must be rank 2")
@@ -1176,12 +1192,15 @@ def tensorwise_fp8_forward_save_v1(input_2d, weight, nstep: int):
     tiles_per_core = row_tiles // grid
 
     out = nl.ndarray((M, N), dtype=nl.bfloat16, buffer=nl.shared_hbm)
-    saved_bits = nl.ndarray((M, K), dtype=nl.uint8, buffer=nl.shared_hbm)
-    saved_e4m3 = saved_bits.view(nl.float8_e4m3)
-    inverse_scales = nl.ndarray((2, P_MAX, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+    saved_bits = saved_e4m3 = inverse_scales = None
+    if save:
+        saved_bits = nl.ndarray((M, K), dtype=nl.uint8, buffer=nl.shared_hbm)
+        saved_e4m3 = saved_bits.view(nl.float8_e4m3)
+        inverse_scales = nl.ndarray((2, P_MAX, 1), dtype=nl.float32, buffer=nl.shared_hbm)
 
     # ---- SBUF layout: per-tile ring buffers pinned at explicit addresses ---------------
     col_split = M < 4 * N
+    kernel_assert(save or not col_split, "the no-save forward supports only the row split (M >= 4N)")
     if col_split:
         # Column split: every core computes ALL row tiles for its own N/2 output columns (no
         # quantized-weight exchange; each core only transposes/quantizes its N-half), and saves
@@ -1544,17 +1563,19 @@ def tensorwise_fp8_forward_save_v1(input_2d, weight, nstep: int):
             a_partial = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_partition_reduce(dst=a_partial, op=nl.maximum, data=a_running)
             # First tiles of this core (into ring slots whose prologue aliases are dead by now).
-            nisa.dma_copy(dst=raw_ring[rot[0]], src=input_2d[program_id * P_MAX:program_id * P_MAX + P_MAX, 0:K], dge_mode=FWD_RAW_DGE, engine=FWD_RAW_ENGINE)
+            if save:
+                nisa.dma_copy(dst=raw_ring[rot[0]], src=input_2d[program_id * P_MAX:program_id * P_MAX + P_MAX, 0:K], dge_mode=FWD_RAW_DGE, engine=FWD_RAW_ENGINE)
             raw_by_pos = []
             a_raw_by_pos = []
             for t in range(ring):
                 raw_by_pos.append(raw_ring[rot[t]])
                 a_raw_by_pos.append(a_raw_ring[rot[t]])
             _fwd_prefetch_tiles(input_2d, raw_by_pos, a_raw_by_pos, prefetch_tiles, grid, program_id, K, k_tiles, tp_group,
-                                first_kmajor=(1 if early_kmajor else 0))
+                                first_kmajor=(1 if early_kmajor else 0), load_raw=save)
             a_amax = _fwd_exchange_amax(a_partial, 0)
             a_qscale, a_inverse = _fp8_scale_from_amax(a_amax, E4M3_MAX)
-            nisa.dma_copy(dst=inverse_scales[program_id, 0:P_MAX, 0:1], src=a_inverse)
+            if save:
+                nisa.dma_copy(dst=inverse_scales[program_id, 0:P_MAX, 0:1], src=a_inverse)
             output_scale = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_tensor(dst=output_scale, data1=a_inverse, data2=b_inverse, op=nl.multiply)
 
@@ -1563,7 +1584,7 @@ def tensorwise_fp8_forward_save_v1(input_2d, weight, nstep: int):
     n_tiles = tiles_per_core
     n_full = n_tiles // ring
     scale0 = _fwd_tile_prepare(input_2d, a_qscale, program_id, raw_ring[rot[0]], a_raw_ring[rot[0]], a_fp8_ring[rot[0]],
-                               K, k_tiles, tp_group, True, True, FWD_KH_FIRST_TILE_HEAD_KTILES, FWD_KH_FIRST_SAVE_DEP)
+                               K, k_tiles, tp_group, True, save, FWD_KH_FIRST_TILE_HEAD_KTILES, FWD_KH_FIRST_SAVE_DEP and save)
     # first group (static): tiles 0 .. ring-1 (or all tiles if fewer)
     first = min(ring, n_tiles)
     for p in nl.static_range(first):
@@ -1571,7 +1592,7 @@ def tensorwise_fp8_forward_save_v1(input_2d, weight, nstep: int):
             input_2d, out, saved_e4m3, b_fp8, a_qscale, output_scale, grid, program_id,
             p, rot[p % ring], p + 1 < n_tiles, (p + 1) < prefetch_tiles, p + 1, rot[(p + 1) % ring],
             raw_ring, quant_ring, a_raw_ring, a_fp8_ring, res_ring, K, k_tiles, tp_group, n_groups, nstep,
-            scale0 if p == 0 else None,
+            scale0 if p == 0 else None, save,
         )
     if n_full >= 3:
         # middle groups: the next tile always exists
@@ -1581,6 +1602,7 @@ def tensorwise_fp8_forward_save_v1(input_2d, weight, nstep: int):
                     input_2d, out, saved_e4m3, b_fp8, a_qscale, output_scale, grid, program_id,
                     local_group * ring + p, rot[p], True, False, local_group * ring + p + 1, rot[(p + 1) % ring],
                     raw_ring, quant_ring, a_raw_ring, a_fp8_ring, res_ring, K, k_tiles, tp_group, n_groups, nstep,
+                    None, save,
                 )
     # remaining tiles (last full group and the remainder), static
     start = (n_full - 1) * ring if n_full >= 2 else first
@@ -1589,6 +1611,7 @@ def tensorwise_fp8_forward_save_v1(input_2d, weight, nstep: int):
             input_2d, out, saved_e4m3, b_fp8, a_qscale, output_scale, grid, program_id,
             p, rot[p % ring], p + 1 < n_tiles, False, p + 1, rot[(p + 1) % ring],
             raw_ring, quant_ring, a_raw_ring, a_fp8_ring, res_ring, K, k_tiles, tp_group, n_groups, nstep,
+            None, save,
         )
 
-    return out, saved_bits, inverse_scales
+    return (out, saved_bits, inverse_scales) if save else out

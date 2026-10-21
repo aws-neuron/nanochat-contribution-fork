@@ -7,6 +7,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 import torch
+from nki.compiler import CompileConfig
 from nki.isa import matmul_perf_mode
 
 from nanochat.trn.kernels.fp8_common import (
@@ -387,7 +388,8 @@ def _dgrad_pipelined_rows(
     )
 
 
-@nki.jit
+# Opt in to non-SSA legalization (off by default for NKI kernels): 1.49 -> 1.35 ms at d24.
+@nki.jit(compile_config=CompileConfig(non_ssa_legalization=True))
 def tensorwise_fp8_linear_dgrad_scaled_v1(
     grad_output,
     weight,

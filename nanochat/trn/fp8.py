@@ -26,6 +26,7 @@ from nanochat.trn.kernels.fp8_dgrad import (
     tensorwise_fp8_linear_dgrad_scaled_v1,
 )
 from nanochat.trn.kernels.fp8_gemm_fwd import (
+    tensorwise_fp8_forward_nosave_v1,
     tensorwise_fp8_forward_save_v1,
     tensorwise_fp8_gemm,
 )
@@ -101,6 +102,7 @@ def fp8_recompute_contexts():
 _FP8_SAVE_E4M3_G2 = tensorwise_e4m3_save[2]
 _FP8_GEMM_G2 = tensorwise_fp8_gemm[2]
 _FP8_FORWARD_SAVE_G2 = tensorwise_fp8_forward_save_v1[2]
+_FP8_FORWARD_NOSAVE_G2 = tensorwise_fp8_forward_nosave_v1[2]
 _FP8_GRAD_SCALE_G2 = tensorwise_fp8_grad_scale_state_v1[2]
 _FP8_DGRAD_SCALED_G2 = tensorwise_fp8_linear_dgrad_scaled_v1[2]
 _FP8_GRAD_SCALE_DGRAD_G2 = tensorwise_fp8_grad_scale_state_dgrad_v1[2]
@@ -207,6 +209,16 @@ def fp8_linear_forward_save(
     bitwise-identical outputs) and consumes the canonical ``weight[out, in]`` directly.
     """
     return _FP8_FORWARD_SAVE_G2(input_2d, weight, nstep)
+
+
+@nki_op("nanochat_fp8::linear_forward_nosave_v1_g2", mutates_args={})
+def fp8_linear_forward_nosave(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    nstep: int,
+) -> torch.Tensor:
+    """``fp8_linear_forward_save`` without the E4M3 save: the same BF16 output only."""
+    return _FP8_FORWARD_NOSAVE_G2(input_2d, weight, nstep)
 
 
 @nki_op("nanochat_fp8::linear_forward_g2", mutates_args={})
@@ -397,11 +409,16 @@ class _NeuronFloat8LinearFn(torch.autograd.Function):
         split_save,
     ):
         weight = master_weight.to(COMPUTE_DTYPE)
-        output, input_bits, input_inverse_scales = fp8_linear_forward_save(
-            input_2d,
-            weight,
-            forward_nstep,
-        )
+        if split_save and input_2d.shape[0] >= 4 * master_weight.shape[0]:
+            # The bytes/scale come from fp8_save_activation below, so skip the fused kernel's save
+            # (the no-save kernel has only the row-split schedule, M >= 4N).
+            output = fp8_linear_forward_nosave(input_2d, weight, forward_nstep)
+        else:
+            output, input_bits, input_inverse_scales = fp8_linear_forward_save(
+                input_2d,
+                weight,
+                forward_nstep,
+            )
         if split_save:
             # Bitwise the same bytes/scale as the fused kernel's, from a save-only kernel: under
             # "full" recompute checkpointing the backward then recomputes this kernel instead of

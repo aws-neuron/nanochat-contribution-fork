@@ -7,6 +7,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 import torch
+from nki.compiler import CompileConfig
 from nki.isa import matmul_perf_mode
 
 from nanochat.trn.kernels.fp8_common import (
@@ -808,7 +809,8 @@ def _wgrad_wide_block(
                     )
 
 
-@nki.jit
+# Opt in to non-SSA legalization (off by default for NKI kernels): 1.81 -> 1.58 ms at d24.
+@nki.jit(compile_config=CompileConfig(non_ssa_legalization=True))
 def tensorwise_fp8_wgrad_saved_persistent_v4(
     grad_output,
     input_bits,
@@ -1166,7 +1168,8 @@ def _store_wgrad_tile_static(
     )
 
 
-@nki.jit
+# Opt in to non-SSA legalization (off by default for NKI kernels): 1.79 -> 1.30 ms at d24.
+@nki.jit(compile_config=CompileConfig(non_ssa_legalization=True))
 def tensorwise_fp8_wgrad_saved_grouped_v1(
     grad_output,
     input_bits,

@@ -7,6 +7,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 import torch
+from nki.compiler import CompileConfig
 from nki.isa import matmul_perf_mode
 
 from nanochat.trn.kernels.fp8_common import (
@@ -52,7 +53,8 @@ def _tensorwise_amax_rows_partial(tensor, row_offset: int, row_count: int, width
     return running
 
 
-@nki.jit
+# Opt in to non-SSA legalization (off by default for NKI kernels): 1.49 -> 0.96 ms at d24.
+@nki.jit(compile_config=CompileConfig(non_ssa_legalization=True))
 def tensorwise_e4m3_save(input_2d):
     """Quantize a BF16 activation once and persist native E4M3 bits in HBM."""
     kernel_assert(len(input_2d.shape) == 2, "input must be rank 2")
@@ -128,7 +130,8 @@ def tensorwise_e4m3_save(input_2d):
     return saved_bits, inverse_scales
 
 
-@nki.jit
+# Opt in to non-SSA legalization (off by default for NKI kernels): 0.93 -> 0.47 ms at d24.
+@nki.jit(compile_config=CompileConfig(non_ssa_legalization=True))
 def tensorwise_fp8_grad_scale_state_v1(grad_output):
     """Compute one E5M2 gradient scale state shared by dgrad and wgrad.
 
