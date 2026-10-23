@@ -7,11 +7,20 @@ from nanochat import trn
 from nanochat.backend import TorchBackend
 from nanochat.common import print0, get_peak_flops, COMPUTE_DTYPE
 from nanochat.trn import attention as _attention
+from nanochat.trn import embedding as _embedding
 
 
 class NeuronBackend(TorchBackend):
     name = "neuron"
     flash_attn = _attention.flash_attn
+
+    def embedding(self, idx, weight):
+        # F.embedding with int32 indices (the faster index dtype on Neuron) and, in training, a sort-based
+        # backward (no scatter) with one host sort per forward shared by wte and the value-embedding tables
+        # (nanochat/trn/embedding.py). Non-Neuron tensors: the reference.
+        if idx.device.type != "neuron":
+            return super().embedding(idx, weight)
+        return _embedding.embedding(idx, weight)
 
     def head_ce_loss(self, x, weight, targets, vocab_size, softcap):
         # One compiled lm_head + softcap + CE graph, chunked over B*T (nanochat/trn/fused_ce.py). Off-device tensors

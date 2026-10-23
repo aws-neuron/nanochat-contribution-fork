@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
-# Accelerator backend (nanochat/backend.py): attention and the fused lm_head + CE loss. The
+# Accelerator backend (nanochat/backend.py): attention, embedding lookups and the fused lm_head + CE loss. The
 # reference implementation is plain torch (upstream nanochat semantics); AWS Trainium's lives in nanochat/trn and is
 # selected there when a Neuron device is available.
 from nanochat.backend import backend
@@ -510,8 +510,8 @@ class GPT(nn.Module):
             T0 = 0 if kv_cache is None else kv_cache.get_pos()
             cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
-        # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
+        # Embed the tokens (backend.embedding(idx, weight) == F.embedding(idx, weight))
+        x = backend.embedding(idx, self.transformer.wte.weight) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
@@ -541,7 +541,7 @@ class GPT(nn.Module):
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            ve = backend.embedding(idx, self.value_embeds[str(i)].weight).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x

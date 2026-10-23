@@ -12,6 +12,7 @@ CPU run inside a Trainium venv still takes the upstream code paths.
 Hooks (T = torch.Tensor)
   name: str                         "torch" | "neuron" (nanochat/optim.py selects the distributed optimizer by it)
   flash_attn: namespace             flash_attn_func(q, k, v, causal, window_size) / flash_attn_with_kvcache(...)
+  embedding(idx: T, weight: T) -> T                 == F.embedding(idx, weight)
   head_ce_loss(x: T, weight: T, targets: T, vocab_size: int, softcap: float) -> T | None
                                     fused lm_head + softcap + mean CE for training, or None (gpt.py computes it)
   peak_flops(device_type: str) -> float
@@ -23,6 +24,7 @@ Hooks (T = torch.Tensor)
   empty_cache(device_type: str) -> None
 """
 import torch
+import torch.nn.functional as F
 
 from nanochat.flash_attention import flash_attn as _torch_flash_attn
 
@@ -30,6 +32,9 @@ from nanochat.flash_attention import flash_attn as _torch_flash_attn
 class TorchBackend:
     name = "torch"
     flash_attn = _torch_flash_attn
+
+    def embedding(self, idx, weight):
+        return F.embedding(idx, weight)
 
     def head_ce_loss(self, x, weight, targets, vocab_size, softcap):
         return None  # upstream: logits -> softcap -> F.cross_entropy in GPT.forward

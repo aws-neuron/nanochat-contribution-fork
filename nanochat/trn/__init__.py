@@ -7,6 +7,7 @@ chat_eval.py and chat_sft.py pick trn/core_eval.py and trn/engine.py on a Neuron
   trn/__init__.py     is_available(), get_backend() and the small runtime shims nanochat/common.py needs
   trn/backend.py      NeuronBackend: the nanochat.backend hooks
   trn/attention.py    NKI flash attention for training shapes, and the Neuron flash_attn_func / flash_attn_with_kvcache
+  trn/embedding.py    int32 lookups and the sort-based embedding backward
   trn/compile.py      per-Block torch.compile and the NKI kernel prewarm
   trn/fused_ce.py     fused lm_head + softcap + CE (one compiled graph)
   trn/optim.py        DistMuonAdamW: fp32 master shards and the fused 6-launch step
