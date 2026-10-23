@@ -82,6 +82,24 @@ fi
 echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
+# The SFT / chat_eval datasets are prefetched once, in one CPU process in the background while pretraining runs, so
+# the 64 / 128 ranks of chat_sft / chat_eval start from the local cache (tasks/common.py load_hub_dataset). No device
+# backend in that process, so it cannot open the NeuronCores that base_train uses.
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c "
+from tasks.gsm8k import GSM8K
+from tasks.mmlu import MMLU
+from tasks.smoltalk import SmolTalk
+from tasks.arc import ARC
+from tasks.humaneval import HumanEval
+SmolTalk(split='train'); SmolTalk(split='test')
+MMLU(subset='all', split='auxiliary_train'); MMLU(subset='all', split='test')
+GSM8K(subset='main', split='train'); GSM8K(subset='main', split='test')
+ARC(subset='ARC-Easy', split='test'); ARC(subset='ARC-Challenge', split='test')
+HumanEval()
+print('SFT / chat_eval datasets cached')
+" &
+TASK_PREFETCH_PID=$!
+
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
 # Trainium recipe: 64 LNC2 ranks, MBS 8 (grad_accum 1 at 8x2048x64 = 1,048,576 tokens), BF16,
 # activation checkpointing on every Block (~10 GiB per rank; SFT inherits it from the checkpoint meta), no in-loop
@@ -101,21 +119,8 @@ wait $BASE_EVAL_SAMPLE_PID
 
 # run SFT and eval the model. SFT: the pretrain step (MBS 8, activation checkpointing, same Block graphs -> compile
 # cache hits; activation checkpointing comes from the base checkpoint's GPTConfig); the SFT optimizer shards have no
-# consumer, so they are not written (64 x 6 GB). The datasets are prefetched once in one process, so the 64 / 128
-# ranks start from the local cache (tasks/common.py load_hub_dataset).
-python -c "
-from tasks.gsm8k import GSM8K
-from tasks.mmlu import MMLU
-from tasks.smoltalk import SmolTalk
-from tasks.arc import ARC
-from tasks.humaneval import HumanEval
-SmolTalk(split='train'); SmolTalk(split='test')
-MMLU(subset='all', split='auxiliary_train'); MMLU(subset='all', split='test')
-GSM8K(subset='main', split='train'); GSM8K(subset='main', split='test')
-ARC(subset='ARC-Easy', split='test'); ARC(subset='ARC-Challenge', split='test')
-HumanEval()
-print('SFT / chat_eval datasets cached')
-"
+# consumer, so they are not written (64 x 6 GB).
+wait $TASK_PREFETCH_PID
 NEURON_USE_SPLIT_REDUCE_SCATTER=1 NEURON_USE_SPLIT_ALLGATHER=1 COLLECTIVE_BUCKETSIZE_IN_MB=2304 \
 torchrun --standalone --nproc_per_node=64 -m scripts.chat_sft -- --device-batch-size=8 --eval-every=-1 --chatcore-every=-1 --save-optimizer=0 --run=$WANDB_RUN
 # chat_eval on 128 LNC1 ranks (one physical core each: ~2x the generative throughput of LNC2-64), static-shape
