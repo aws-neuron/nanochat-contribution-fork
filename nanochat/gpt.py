@@ -160,9 +160,6 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
         self.activation_checkpoint = config.activation_checkpoint
-        # Optional torch.utils.checkpoint context_fn: None = plain full recompute. Trainium's compile_model sets one
-        # for FP8 Blocks so the FP8 saved state follows the checkpoint (nanochat.trn.fp8.fp8_recompute_contexts).
-        self.checkpoint_context_fn = None
 
     def _fwd_attn(self, x, ve, cos_sin, window_size, kv_cache):
         return self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
@@ -171,10 +168,7 @@ class Block(nn.Module):
         return self.mlp(norm(x))
 
     def _checkpoint(self, function, *args):
-        kwargs = {"use_reentrant": False, "preserve_rng_state": False}
-        if self.checkpoint_context_fn is not None:
-            kwargs["context_fn"] = self.checkpoint_context_fn
-        return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
+        return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant=False, preserve_rng_state=False)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         # Two checkpoint regions (attn, then mlp): measurably faster than one region over the whole Block on

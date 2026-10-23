@@ -169,7 +169,6 @@ I've published a number of guides that might contain helpful information, most r
 │   ├── dataloader.py               # Tokenizing Distributed Data Loader
 │   ├── dataset.py                  # Download/read utils for pretraining data
 │   ├── engine.py                   # Efficient model inference with KV Cache
-│   ├── fp8.py                      # FP8 Linear (tensorwise) for CUDA; facade for the backend's
 │   ├── execution.py                # Allows the LLM to execute Python code as tool
 │   ├── gpt.py                      # The GPT nn.Module Transformer
 │   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)

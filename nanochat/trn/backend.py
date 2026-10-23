@@ -11,14 +11,6 @@ from nanochat.trn import embedding as _embedding
 class NeuronBackend(TorchBackend):
     name = "neuron"
     flash_attn = _attention.flash_attn
-    fp8_device_types = ("cuda", "neuron")
-
-    @property
-    def Float8Linear(self):
-        # Imported on demand: registers the nanochat_fp8 nki_ops (must happen before torch.compile traces them,
-        # which nanochat.fp8's import order guarantees) and pulls in the kernel modules.
-        from nanochat.trn.fp8 import NeuronFloat8Linear
-        return NeuronFloat8Linear
 
     # ---- model hooks (nanochat/gpt.py)
     def embedding(self, idx, weight):
@@ -37,11 +29,6 @@ class NeuronBackend(TorchBackend):
         from nanochat.trn.fused_ce import head_ce_loss
         return head_ce_loss(x, weight, targets, vocab_size=vocab_size, softcap=softcap, ignore_index=-1, chunk_size=512)
 
-    # ---- FP8 (nanochat/fp8.py)
-    def fp8_module_scope(self, fqn):
-        # FP8 on the MLP Linears only: attention-projection FP8 loses end to end on Trainium.
-        return ".mlp." in f".{fqn}."
-
     # ---- training-script hooks (nanochat/trn/train_hooks.py, nanochat/trn/compile.py)
     def peak_flops(self, device_type):
         from nanochat.trn import train_hooks
@@ -51,10 +38,9 @@ class NeuronBackend(TorchBackend):
         from nanochat.trn import train_hooks
         train_hooks.materialize(model, device)
 
-    def compile_model(self, model, fp8=False, batch_size=None, seq_len=None):
+    def compile_model(self, model, batch_size=None, seq_len=None):
         from nanochat.trn import compile as _compile
-        return _compile.compile_model(model, fp8=fp8, batch_size=batch_size, seq_len=seq_len,
-                                      reference=super().compile_model)
+        return _compile.compile_model(model, batch_size=batch_size, seq_len=seq_len, reference=super().compile_model)
 
     def prefetch_after_optimizer_step(self, device_type):
         from nanochat.trn import train_hooks

@@ -20,7 +20,6 @@ from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, g
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.backend import backend
-from nanochat.fp8 import convert_model_to_fp8, disable_fp8
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -39,9 +38,6 @@ parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT) the m
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps|neuron (empty = autodetect)")
-# FP8 training (same recipe and Linears as base_train --fp8, so SFT reuses the pretrain graphs)
-parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU or Trainium)")
-parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model loading
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
@@ -122,13 +118,9 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
-# Convert Linear layers to Float8Linear if --fp8 is set (same Linears as base_train: nanochat/fp8.py)
-if args.fp8:
-    args.fp8 = convert_model_to_fp8(model, device_type, args.fp8_recipe)
-
 orig_model = model
 print0(f"Activation checkpointing: {model.config.activation_checkpoint}")
-model = backend.compile_model(model, fp8=args.fp8, batch_size=args.device_batch_size, seq_len=args.max_seq_len)
+model = backend.compile_model(model, batch_size=args.device_batch_size, seq_len=args.max_seq_len)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -360,8 +352,7 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model):
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -389,9 +380,8 @@ while True:
         for task_name in all_tasks:
             limit = args.chatcore_max_cat if task_name in categorical_tasks else args.chatcore_max_sample
             max_problems = None if limit < 0 else limit  # -1 means no limit
-            with disable_fp8(orig_model):
-                acc = run_chat_eval(task_name, orig_model, tokenizer, engine,
-                                    batch_size=args.device_batch_size, max_problems=max_problems)
+            acc = run_chat_eval(task_name, orig_model, tokenizer, engine,
+                                batch_size=args.device_batch_size, max_problems=max_problems)
             task_results[task_name] = acc
             print0(f"  {task_name}: {100*acc:.2f}%")
         # Compute ChatCORE metrics (mean centered accuracy, ranges from 0=random to 1=perfect)

@@ -1,6 +1,6 @@
 """Accelerator backend protocol for nanochat.
 
-nanochat's model (gpt.py), FP8 facade (fp8.py), optimizer selection (optim.py) and the training scripts are
+nanochat's model (gpt.py), optimizer selection (optim.py) and the training scripts are
 written against the small protocol below. `TorchBackend` is the reference implementation -- upstream
 nanochat's behaviour (FA3/SDPA attention, F.embedding, one torch.compile over the model) --
 and a device package can supply its own implementation of the hooks it needs. AWS Trainium's lives in nanochat/trn
@@ -16,16 +16,12 @@ Protocol (T = torch.Tensor)
     embedding(idx: T, weight: T) -> T                 == F.embedding(idx, weight)
     head_ce_loss(x: T, weight: T, targets: T, vocab_size: int, softcap: float) -> T | None
                                     fused lm_head + softcap + mean CE for training, or None (gpt.py computes it)
-  FP8 (nanochat/fp8.py)
-    Float8Linear: type | None       backend Float8Linear class (None -> nanochat.fp8.CudaFloat8Linear)
-    fp8_module_scope(fqn: str) -> bool   which Linears --fp8 converts ("all" upstream; Trainium: the MLP Linears)
-    fp8_device_types: tuple[str]    device types that have an FP8 Linear implementation
   training-script hooks (scripts/base_train.py, scripts/chat_sft.py)
     peak_flops(device_type: str) -> float
     materialize(model, device) -> None                (to_empty + init_weights)
-    compile_model(model, fp8=False, batch_size=None, seq_len=None) -> model
-                                    upstream: torch.compile(model, dynamic=False); a backend may also set its
-                                    checkpoint policy and pre-compile kernels for the (batch_size, seq_len) shape
+    compile_model(model, batch_size=None, seq_len=None) -> model
+                                    upstream: torch.compile(model, dynamic=False); a backend may also
+                                    pre-compile kernels for the (batch_size, seq_len) training shape
     prefetch_after_optimizer_step(device_type: str) -> bool
     empty_cache(device_type: str) -> None
   name: str                         "torch" | "neuron" (nanochat/optim.py selects the distributed optimizer by it)
@@ -42,8 +38,6 @@ from nanochat.flash_attention import flash_attn as _torch_flash_attn
 class TorchBackend:
     name = "torch"
     flash_attn = _torch_flash_attn
-    Float8Linear = None
-    fp8_device_types = ("cuda",)
 
     # ---- model hooks (nanochat/gpt.py)
     def embedding(self, idx, weight):
@@ -51,10 +45,6 @@ class TorchBackend:
 
     def head_ce_loss(self, x, weight, targets, vocab_size, softcap):
         return None  # upstream: logits -> softcap -> F.cross_entropy in GPT.forward
-
-    # ---- FP8 (nanochat/fp8.py)
-    def fp8_module_scope(self, fqn):
-        return True  # upstream: every Linear that passes the shape filter
 
     # ---- training-script hooks
     def peak_flops(self, device_type):
@@ -64,7 +54,7 @@ class TorchBackend:
         model.to_empty(device=device)  # all tensors get storage on the target device, uninitialized
         model.init_weights()
 
-    def compile_model(self, model, fp8=False, batch_size=None, seq_len=None):
+    def compile_model(self, model, batch_size=None, seq_len=None):
         return torch.compile(model, dynamic=False)  # the inputs never change shape so dynamic=False is safe
 
     def prefetch_after_optimizer_step(self, device_type):

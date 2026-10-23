@@ -19,12 +19,13 @@ import time
 import math
 import argparse
 from dataclasses import asdict
+from contextlib import contextmanager
 
 import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.backend import backend
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized, get_synchronize, get_max_memory_fn
@@ -44,7 +45,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps|neuron (empty = autodetect)")
 # FP8 training
-parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU or Trainium)")
+parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
@@ -165,10 +166,80 @@ if resuming:
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
 
-# Convert Linear layers to Float8Linear if --fp8 is set (shared with chat_sft.py: nanochat/fp8.py)
-from nanochat.fp8 import convert_model_to_fp8, disable_fp8
+# Convert Linear layers to Float8Linear if --fp8 is set
 if args.fp8:
-    args.fp8 = convert_model_to_fp8(model, device_type, args.fp8_recipe)
+    if device_type != "cuda":
+        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
+    else:
+        # our custom fp8 is simpler than torchao, written for exact API compatibility
+        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
+        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        import torch.nn as nn
+
+        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
+        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+            if not isinstance(mod, nn.Linear):
+                return False
+            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+                return False
+            if min(mod.in_features, mod.out_features) < 128:
+                return False
+            return True
+
+        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
+        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
+        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+        num_skipped = num_linear - num_fp8
+        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+
+# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
+@contextmanager
+def disable_fp8(model):
+    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
+
+    CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
+    we swap out Float8Linear modules entirely and restore them after.
+    """
+    import torch.nn as nn
+
+    # Find all Float8Linear modules and their locations
+    fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
+    for name, module in model.named_modules():
+        if 'Float8' in type(module).__name__:
+            if '.' in name:
+                parent_name, attr_name = name.rsplit('.', 1)
+                parent = model.get_submodule(parent_name)
+            else:
+                parent = model
+                attr_name = name
+            fp8_locations.append((parent, attr_name, module))
+
+    if not fp8_locations:
+        yield  # No FP8 modules, nothing to do
+        return
+
+    # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
+    # Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
+    for parent, attr_name, fp8_module in fp8_locations:
+        linear = Linear(
+            fp8_module.in_features,
+            fp8_module.out_features,
+            bias=fp8_module.bias is not None,
+            device="meta",  # Use meta device to avoid unnecessary VRAM allocation
+            dtype=fp8_module.weight.dtype,
+        )
+        linear.weight = fp8_module.weight  # share, don't copy
+        if fp8_module.bias is not None:
+            linear.bias = fp8_module.bias
+        setattr(parent, attr_name, linear)
+
+    try:
+        yield
+    finally:
+        # Restore Float8Linear modules
+        for parent, attr_name, fp8_module in fp8_locations:
+            setattr(parent, attr_name, fp8_module)
 
 # -----------------------------------------------------------------------------
 # Compile the model
@@ -176,7 +247,7 @@ if args.fp8:
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 print0(f"Activation checkpointing: {model_config.activation_checkpoint}")
 # upstream: torch.compile(model, dynamic=False). Trainium: one compiled graph per Block + NKI kernel prewarm for the training shape
-model = backend.compile_model(model, fp8=args.fp8, batch_size=args.device_batch_size, seq_len=args.max_seq_len)
+model = backend.compile_model(model, batch_size=args.device_batch_size, seq_len=args.max_seq_len)
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
