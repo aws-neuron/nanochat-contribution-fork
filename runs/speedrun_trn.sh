@@ -104,8 +104,7 @@ TASK_PREFETCH_PID=$!
 # Trainium recipe: 64 LNC2 ranks, MBS 8 (grad_accum 1 at 8x2048x64 = 1,048,576 tokens), BF16,
 # activation checkpointing on every Block (~10 GiB per rank; SFT inherits it from the checkpoint meta), no in-loop
 # eval (a second MBS=8 dataloader + forward does not fit next to the training buffers; base_eval below measures
-# CORE+bpb on the final checkpoint), 2304 MiB collective buckets with split reduce-scatter / all-gather.
-NEURON_USE_SPLIT_REDUCE_SCATTER=1 NEURON_USE_SPLIT_ALLGATHER=1 COLLECTIVE_BUCKETSIZE_IN_MB=2304 \
+# CORE+bpb on the final checkpoint).
 torchrun --standalone --nproc_per_node=64 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=8 --activation-checkpoint=1 --eval-every=-1 --core-metric-every=-1 --sample-every=-1 --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val (64 ranks, fixed-shape CORE batches), and draw samples (CPU:
 # generative decode of short prompts is faster there and uses no NeuronCore, so it runs alongside)
@@ -121,7 +120,6 @@ wait $BASE_EVAL_SAMPLE_PID
 # cache hits; activation checkpointing comes from the base checkpoint's GPTConfig); the SFT optimizer shards have no
 # consumer, so they are not written (64 x 6 GB).
 wait $TASK_PREFETCH_PID
-NEURON_USE_SPLIT_REDUCE_SCATTER=1 NEURON_USE_SPLIT_ALLGATHER=1 COLLECTIVE_BUCKETSIZE_IN_MB=2304 \
 torchrun --standalone --nproc_per_node=64 -m scripts.chat_sft -- --device-batch-size=8 --eval-every=-1 --chatcore-every=-1 --save-optimizer=0 --run=$WANDB_RUN
 # chat_eval on 128 LNC1 ranks (one physical core each: ~2x the generative throughput of LNC2-64), static-shape
 # kv-cache decode with prefill buckets and 16 problems decoded per rank concurrently (nanochat/trn/engine.py)
