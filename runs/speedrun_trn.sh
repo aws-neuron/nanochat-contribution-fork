@@ -29,6 +29,8 @@ command -v neuronx-cc >/dev/null || { echo "neuronx-cc not on PATH: activate the
 export NEURON_LOGICAL_NC_CONFIG=2
 export NEURON_CC_FLAGS="--optlevel 1"
 export TORCH_NEURONX_LOG_LEVEL=WARNING
+# Device memory allocator: medium-size segments for the d24 buffers (the setting this recipe was validated with).
+export TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG="${TORCH_NEURONX_SEGMENT_ALLOCATOR_CONFIG:-kMediumThreshold=268435456,kMediumSegmentSize=536870912}"
 
 # Compile-service guard. torch_neuronx compiles NEFFs through an asynchronous worker pool unless
 # NEURON_COMPILE_SERVICE=0 is exported. A speedrun launched from a shell that exports it would compile every
