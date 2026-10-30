@@ -27,7 +27,7 @@ class NeuronBackend(TorchBackend):
         if x.device.type != "neuron":
             return None
         from nanochat.trn.fused_ce import head_ce_loss
-        return head_ce_loss(x, weight, targets, vocab_size=vocab_size, softcap=softcap, ignore_index=-1, chunk_size=512)
+        return head_ce_loss(x, weight, targets, vocab_size=vocab_size, softcap=softcap, ignore_index=-1, chunk_size=1024)
 
     # ---- training-script hooks (nanochat/trn/train_hooks.py, nanochat/trn/compile.py)
     def peak_flops(self, device_type):
