@@ -47,7 +47,6 @@ _PE_TRANSPOSE_TILES_SWA = 2
 _PE_TRANSPOSE_TILES_FULL = 0
 _KV_RING = 3
 _Q_PACK_RING = 4
-_PV_PSUM_RING = 2
 # exp + transpose are issued per "super-chunk" of up to 8 key tiles starting at the window
 # start (a 5-tile sliding window is a single exp / a single 5-block DMA transpose).
 _EXP_SUPER_TILES = 8
@@ -480,7 +479,6 @@ def _qk_reduce_group(
         first_tile = chunks[chunk_index][0]
         num_tiles = chunks[chunk_index][1]
         cols = num_tiles * _Q_TILE
-        k0 = first_tile * _Q_TILE
         qk_psum = qk_psum_slots[_qk_slot(slot_base, chunk_index, num_chunks)][:, nl.ds(0, cols)]
         last_chunk = chunk_index == num_chunks - 1
         h = nisa.tensor_scalar_reduce(
@@ -1171,12 +1169,6 @@ def bthd_flash_fwd(
 
     q_transposed = nl.ndarray((head_dim, _Q_TILE), dtype=q.dtype, buffer=nl.sbuf)
     q_pack_capacity = min(seqlen, _Q_GROUPS_PER_PACK * _Q_TILE)
-    q_packs = [
-        nl.ndarray((head_dim, q_pack_capacity), dtype=q.dtype, buffer=nl.sbuf),
-        nl.ndarray((head_dim, q_pack_capacity), dtype=q.dtype, buffer=nl.sbuf),
-        nl.ndarray((head_dim, q_pack_capacity), dtype=q.dtype, buffer=nl.sbuf),
-        nl.ndarray((head_dim, q_pack_capacity), dtype=q.dtype, buffer=nl.sbuf),
-    ]
 
     # Four 512-key fp32 PSUM slots (one bank each) for the chunked QK matmuls of the pipelined
     # path; the general fallback below uses slot 0.
@@ -1222,11 +1214,6 @@ def bthd_flash_fwd(
     pv_sbuf = nl.ndarray((_Q_TILE, head_dim), dtype=nl.float32, buffer=nl.sbuf)
     reciprocal_sum = nl.ndarray((_Q_TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
     final_output = nl.ndarray((_Q_TILE, head_dim), dtype=q.dtype, buffer=nl.sbuf)
-    pipeline_reciprocal_sum = nl.ndarray((_Q_TILE, _PV_PSUM_RING, 1), dtype=nl.float32, buffer=nl.sbuf)
-    pipeline_final_output = [
-        nl.ndarray((_Q_TILE, head_dim), dtype=q.dtype, buffer=nl.sbuf),
-        nl.ndarray((_Q_TILE, head_dim), dtype=q.dtype, buffer=nl.sbuf),
-    ]
     if return_lse:
         lse_log_sum = nl.ndarray((_Q_TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
         lse_value = nl.ndarray((_Q_TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -1237,39 +1224,17 @@ def bthd_flash_fwd(
             nl.ndarray((_Q_TILE, q_tiles_per_plane), dtype=nl.float32, buffer=nl.sbuf),
         ]
 
-    # The one-section path pipelines Q groups continuously across planes: QK runs
-    # _PIPE_QK_AHEAD groups ahead of PV and EXP _PIPE_EXP_AHEAD ahead, so per-group state uses
-    # _PIPE_RING-deep rings.
-    pipeline_partial_sum = nl.ndarray(
-        (_Q_TILE, pipe_ring, mm1_tiles_per_section),
-        dtype=nl.float32,
-        buffer=nl.sbuf,
-    )
-    pipeline_section_sum = nl.ndarray((_Q_TILE, pipe_ring, 1), dtype=nl.float32, buffer=nl.sbuf)
-    # Per-plane staging of the row sums and negated maxima ([128, T//128], ring of 2 planes): the
-    # LSE (log + subtract) is then computed once per plane instead of once per Q group.
-    plane_section_sum = [
-        nl.ndarray((_Q_TILE, q_tiles_per_plane), dtype=nl.float32, buffer=nl.sbuf),
-        nl.ndarray((_Q_TILE, q_tiles_per_plane), dtype=nl.float32, buffer=nl.sbuf),
-    ]
-    plane_row_max = [
-        nl.ndarray((_Q_TILE, q_tiles_per_plane), dtype=nl.float32, buffer=nl.sbuf),
-        nl.ndarray((_Q_TILE, q_tiles_per_plane), dtype=nl.float32, buffer=nl.sbuf),
-    ]
+    # Per-plane log row sums ([128, T//128]): the LSE (log + subtract) is computed once per plane instead of
+    # once per Q group.
     plane_log_sum = nl.ndarray((_Q_TILE, q_tiles_per_plane), dtype=nl.float32, buffer=nl.sbuf)
-    plane_recip = [
-        nl.ndarray((_Q_TILE, q_tiles_per_plane), dtype=nl.float32, buffer=nl.sbuf),
-        nl.ndarray((_Q_TILE, q_tiles_per_plane), dtype=nl.float32, buffer=nl.sbuf),
-    ]
     final_batches = []
     for ring_index in range(_V3_FINAL_RING):
         final_batches.append(nl.ndarray((_Q_TILE, _V3_STORE_BATCH, head_dim), dtype=q.dtype, buffer=nl.sbuf))
     pv_psum_ring = []
     pv_bytes = head_dim * 4
-    assert _V3_PV_RING * pv_bytes <= _PSUM_BANK_BYTES and 2 * pv_bytes <= _PSUM_BANK_BYTES
+    assert _V3_PV_RING * pv_bytes <= _PSUM_BANK_BYTES
     for ring_index in range(_V3_PV_RING):
         pv_psum_ring.append(_psum_at((_Q_TILE, head_dim), nl.float32, 4, ring_index * pv_bytes))
-    pipeline_pv_psums = [_psum_at((_Q_TILE, head_dim), nl.float32, 5, i * pv_bytes) for i in range(2)]
     tp_bytes = _Q_TILE * 2
     pipeline_tp_psums = [[_psum_at((_Q_TILE, _Q_TILE), q.dtype, 6, (3 * r + j) * tp_bytes) for j in range(3)] for r in range(2)]
 
@@ -1293,7 +1258,6 @@ def bthd_flash_fwd(
         total_groups = total_sets * groups_per_set
         groups_per_pack_block = _Q_GROUPS_PER_PACK * heads_per_set
         pack_blocks_per_set = q_tiles_per_plane // _Q_GROUPS_PER_PACK
-        total_pack_blocks = total_sets * pack_blocks_per_set
         assert q_tiles_per_plane % _Q_GROUPS_PER_PACK == 0
         slots_per_group = 2 if use_sliding_window else _QK_NUM_SLOTS
         # The next head set's K/V load overwrites ring slot (s+1) % KV_RING; in program order it must
