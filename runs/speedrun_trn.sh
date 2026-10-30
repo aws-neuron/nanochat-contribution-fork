@@ -40,8 +40,8 @@ fi
 
 # Fresh cache: torch_neuronx defaults TORCH_NEURONX_HLO_CACHE_DIR to /tmp/hlo_cache, so a speedrun pays a cold
 # compile (the headline number includes it). Export TORCH_NEURONX_HLO_CACHE_DIR / TORCH_NEURONX_NEFF_CACHE_DIR to
-# persistent directories yourself for iterative dev runs. Within one speedrun the SFT stage reuses the pretrain
-# Block graphs from the same cache.
+# persistent directories yourself for iterative dev runs. SFT runs at a different micro-batch size than
+# pretraining, so it compiles its own Block graphs.
 echo "Compile caches: HLO=${TORCH_NEURONX_HLO_CACHE_DIR:-/tmp/hlo_cache (default)} NEFF=${TORCH_NEURONX_NEFF_CACHE_DIR:-<torch_neuronx default>}"
 
 # -----------------------------------------------------------------------------
@@ -101,11 +101,10 @@ print('SFT / chat_eval datasets cached')
 TASK_PREFETCH_PID=$!
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-# Trainium recipe: 64 LNC2 ranks, MBS 8 (grad_accum 1 at 8x2048x64 = 1,048,576 tokens), BF16,
-# activation checkpointing on every Block (~10 GiB per rank; SFT inherits it from the checkpoint meta), no in-loop
-# eval (a second MBS=8 dataloader + forward does not fit next to the training buffers; base_eval below measures
-# CORE+bpb on the final checkpoint).
-torchrun --standalone --nproc_per_node=64 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=8 --activation-checkpoint=1 --eval-every=-1 --core-metric-every=-1 --sample-every=-1 --run=$WANDB_RUN
+# Trainium recipe: 64 LNC2 ranks, MBS 2 with grad_accum 4 (4 x 2x2048x64 = 1,048,576 tokens; ~14 GiB per rank, the
+# largest MBS that fits without activation checkpointing), BF16, no in-loop eval (base_eval below measures CORE+bpb
+# on the final checkpoint).
+torchrun --standalone --nproc_per_node=64 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=2 --eval-every=-1 --core-metric-every=-1 --sample-every=-1 --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val (64 ranks, fixed-shape CORE batches), and draw samples (CPU:
 # generative decode of short prompts is faster there and uses no NeuronCore, so it runs alongside)
 OMP_NUM_THREADS=16 python -m scripts.base_eval --eval sample --device-type=cpu &
@@ -116,11 +115,12 @@ wait $BASE_EVAL_SAMPLE_PID
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
 
-# run SFT and eval the model. SFT: the pretrain step (MBS 8, activation checkpointing, same Block graphs -> compile
-# cache hits; activation checkpointing comes from the base checkpoint's GPTConfig); the SFT optimizer shards have no
+# run SFT and eval the model. SFT stays at MBS 8 (grad_accum 1) with activation checkpointing on every Block: the
+# SFT loss is a mean over the supervised tokens of each micro-batch, and packed SFT rows carry very different numbers
+# of them, so MBS 2 x 4 would change the objective (and lowers the chat scores). The SFT optimizer shards have no
 # consumer, so they are not written (64 x 6 GB).
 wait $TASK_PREFETCH_PID
-torchrun --standalone --nproc_per_node=64 -m scripts.chat_sft -- --device-batch-size=8 --eval-every=-1 --chatcore-every=-1 --save-optimizer=0 --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=64 -m scripts.chat_sft -- --device-batch-size=8 --activation-checkpoint=1 --eval-every=-1 --chatcore-every=-1 --save-optimizer=0 --run=$WANDB_RUN
 # chat_eval on 128 LNC1 ranks (one physical core each: ~2x the generative throughput of LNC2-64), static-shape
 # kv-cache decode with prefill buckets and 16 problems decoded per rank concurrently (nanochat/trn/engine.py)
 NEURON_LOGICAL_NC_CONFIG=1 \

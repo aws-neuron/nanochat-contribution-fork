@@ -45,7 +45,8 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     # Activation checkpointing: recompute each Block's attn / mlp region in the backward instead of keeping its
     # activations live (two regions per Block, see Block.forward). Default FALSE = upstream (no checkpointing).
-    # On Trainium it is load-bearing -- d24 at MBS>=4 does not fit without it -- so the speedrun turns it on.
+    # On Trainium d24 at MBS>=4 does not fit without it; the speedrun pretrains at MBS 2 without it and runs SFT at
+    # MBS 8 with it (chat_sft --activation-checkpoint).
     # A config field rather than an env var so it travels with the model into the checkpoint meta.
     activation_checkpoint: bool = False
 

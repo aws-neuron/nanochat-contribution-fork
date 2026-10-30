@@ -43,6 +43,7 @@ parser.add_argument("--model-tag", type=str, default=None, help="model tag to lo
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
 parser.add_argument("--save-optimizer", type=int, default=1, help="save the optimizer shards with the SFT checkpoint (0=no, 1=yes)")
+parser.add_argument("--activation-checkpoint", type=int, default=-1, help="checkpoint each Block's attn and mlp region (1=on, 0=off, -1 = inherit from pretrain)")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes (default: inherit from pretrained checkpoint)
@@ -118,8 +119,13 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
-orig_model = model
+if args.activation_checkpoint >= 0:
+    model.config.activation_checkpoint = bool(args.activation_checkpoint)
+    for block in model.transformer.h:
+        block.activation_checkpoint = model.config.activation_checkpoint
 print0(f"Activation checkpointing: {model.config.activation_checkpoint}")
+
+orig_model = model
 model = backend.compile_model(model, batch_size=args.device_batch_size, seq_len=args.max_seq_len)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
