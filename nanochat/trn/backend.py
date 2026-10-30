@@ -14,8 +14,8 @@ class NeuronBackend(TorchBackend):
 
     # ---- model hooks (nanochat/gpt.py)
     def embedding(self, idx, weight):
-        # F.embedding with int32 indices (TorchNeuron lowers int64 indices through a CPU round-trip on every
-        # call) and, in training, the NKI scatter-add backward with one token-sort plan per forward shared by wte
+        # F.embedding with int32 indices (the faster index dtype on Neuron: int64 indices take a host round trip on
+        # every call) and, in training, the NKI scatter-add backward with one token-sort plan per forward shared by wte
         # and the value-embedding tables (nanochat/trn/embedding.py). Non-Neuron tensors: the reference.
         if idx.device.type != "neuron":
             return super().embedding(idx, weight)

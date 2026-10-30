@@ -111,7 +111,7 @@ class CausalSelfAttention(nn.Module):
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         # QK norm before rotary: rotary rotates pairs of dims, so it keeps the per-head L2 norm and
-        # norm(rotary(x)) == rotary(norm(x)). neuronx-cc 2.0.410046 lowers rotary followed by norm about 3x slower.
+        # norm(rotary(x)) == rotary(norm(x)) up to rounding. Trainium compiles this order to faster code.
         q, k = norm(q), norm(k) # QK norm
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better

@@ -5,14 +5,14 @@ Equivalent to
     logits = softcap * tanh((x @ W.T)[:, :vocab_size] / softcap)   # fp32
     F.cross_entropy(logits, targets, ignore_index=ignore_index, reduction="mean")
 but compiled as ONE torch.compile(backend="neuron") graph: AOTAutograd synthesizes the backward, so the eager chunked-CE
-backward dispatch storm (the source of the SFT per-step drift, 5.2 -> 9.6 s over 479 steps on trn2) never runs.
+backward, hundreds of small launches per step (and an SFT per-step drift of 5.2 -> 9.6 s over 479 steps), never runs.
 Chunking over the flattened B*T dim keeps the peak transient at chunk_size*V instead of the full (B*T, V) fp32 logits.
 
 Two choices, both measured at d24 / MBS 8 / T 2048 and fixed here:
   * the loss is written as nll = logsumexp(z) - z[target] with the cast weight transposed ONCE outside the chunk loop
     (algebraically -log_softmax(z)[target]; log_softmax is z - logsumexp(z) internally). Saved-for-backward bytes
     7216 -> 4240 MiB, CE fwd 42 -> 28 ms, bwd 66 -> 58 ms; dx / dW differ from the naive form by 1 ulp on 0.01 % /
-    0.15 % of elements (validated by a loss-trajectory A/B before it became the C2 default).
+    0.15 % of elements (validated with a loss-trajectory A/B).
   * the graph is partitioned with torch's min_cut_rematerialization_partition (`neuron_mincut_backend`: recompute cheap
     pointwise ops in the backward instead of saving their fp32 outputs): saved bytes 4240 -> 2192 MiB. Scoped to this
     compile; the Block compiles keep torch_neuronx's default partitioner.

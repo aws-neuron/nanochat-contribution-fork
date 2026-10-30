@@ -1,11 +1,5 @@
 """BTHD-native MHA forward/backward kernels for Neuron training.
 
-VENDORED, not authored here: copied verbatim from the bthd-attention-nki development repo at
-commit a38a17255b96 ("Add training memory safeguards"). It lives in-tree because
-nki_attention_bthd.py used to import it via an absolute path outside the repo, which meant any
-other checkout silently lost the BTHD path (the ImportError is swallowed and training falls back
-to slower SDPA with nothing in the log). Edit upstream and re-vendor rather than patching here.
-
 This is the performance-oriented implementation.  It keeps one 128x2048
 score/probability section in SBUF, so the requested T=2048 shape performs a
 single softmax rather than an online merge after every 512 keys.  Longer
@@ -51,7 +45,7 @@ _Q_PACK_RING = 4
 # start (a 5-tile sliding window is a single exp / a single 5-block DMA transpose).
 _EXP_SUPER_TILES = 8
 _MASK_VALUE = -3.0e38
-# Decoupled cross-plane pipeline (round 1): per iteration t the stages are
+# Decoupled cross-plane pipeline: per iteration t the stages are
 #   QK matmuls(t+QK_AHEAD) -> TSCR(t+QK_AHEAD-TSCR_LAG) -> EXP(t+EXP_AHEAD) [+ DMA transpose]
 #   -> PE transposes + copies(t+TP_AHEAD) -> PV(t) -> normalize/store(t-NORM_LAG),
 # so that every in-order engine queue only sees instructions whose inputs were produced in an
@@ -60,13 +54,13 @@ _V3_QK_AHEAD_SWA = 12
 _V3_EXP_AHEAD_SWA = 10
 _V3_TSCR_LAG_SWA = 1
 _V3_NORM_LAG_SWA = 1
-_V3_QK_AHEAD_FULL = 6  # gen3: was 8 (ring 10 spills on trn2)
-_V3_EXP_AHEAD_FULL = 5  # gen3: was 6
+_V3_QK_AHEAD_FULL = 6  # with 8 (and a ring of 10) the full-causal pipeline spills on trn2
+_V3_EXP_AHEAD_FULL = 5
 _V3_TSCR_LAG_FULL = 0
 _V3_NORM_LAG_FULL = 1
 _V3_TP_AHEAD = 1
 _V3_RING_SWA = 16
-_V3_RING_FULL = 8  # gen3: was 10
+_V3_RING_FULL = 8
 _V3_PE_SWA = 3
 _V3_PE_FULL = 2
 _V3_DMA_TP_IN_EXP_STAGE = True
@@ -87,7 +81,7 @@ _V3_STORE_DGE = nisa.dge_mode.swdge
 _V3_VLOAD_DGE = nisa.dge_mode.unknown
 _V3_FINAL_RING = 4
 _V3_PV_RING = 4
-# round 4: next-set loads issued <load_at> groups into the set, anchored (depends_on) to the PV stage
+# next-set loads issued <load_at> groups into the set, anchored (depends_on) to the PV stage
 _V9_LOAD_AT_SWA = 3
 _V9_LOAD_LAG_SWA = 0
 _V9_LOAD_AT_FULL = 0
@@ -113,7 +107,7 @@ _V6_PAIR_LOADS = True
 _V3_MASK_PAIR = True
 # LSE of both heads of a set stored with one DMA.
 _V6_LSE_PAIR = True
-# Scheduling pins (nisa depends_on edges), see gen_chain.py
+# Scheduling pins (nisa depends_on edges)
 _V7_PIN_RECIP = False
 _V7_PIN_TSCR = False
 _V7_PIN_EXP = False
@@ -124,10 +118,10 @@ _V7_SCHAIN = True
 _V7_TCHAIN = False
 _V7_PVANCH = True
 _V7_TPIN = False
-# round 5: the next head set's K^T and Q^T transposing loads are issued as separate single DMAs at separate triggers
+# the next head set's K^T and Q^T transposing loads are issued as separate single DMAs at separate triggers
 # (qk_r values), each anchored (depends_on) to the latest P@V matmul, so the two 1 MiB blocks never sit back to back on
-# the serialized DMA-transpose queue (LOAD_PIECES > 1 would split a load into key/token ranges: measured worse, the
-# compiler tracks the destination tensor as a whole).  V load (SWDGE, GpSimd queue) unchanged.
+# the serialized DMA-transpose queue (LOAD_PIECES > 1 would split a load into key/token ranges: measured slower, as
+# the dependencies are tracked per destination tensor).  V load (SWDGE, GpSimd queue) unchanged.
 _V10_LOAD_PIECES_SWA = 1
 _V10_LOAD_PIECES_FULL = 1
 _V10_K_TRIG_SWA = (3,)
@@ -138,8 +132,8 @@ _V10_V_TRIG_SWA = 3
 _V10_V_TRIG_FULL = 0
 _V10_LOAD_ANCHOR_SWA = True
 _V10_LOAD_ANCHOR_FULL = True
-# round 5: batched reciprocal issued this many iterations ahead of its first consuming normalize
-# round 5 (sw0, TSCR lag 0): chunk 0 of the next group's QK matmul is issued right after this iteration's P@V so the
+# batched reciprocal issued this many iterations ahead of its first consuming normalize
+# (sw0, TSCR lag 0): chunk 0 of the next group's QK matmul is issued right after this iteration's P@V so the
 # first TSCR chunk of a group never waits on a matmul queued behind the previous P@V in the in-order Tensor queue.
 _V10_QK0_EARLY_SWA = False
 _V10_QK0_EARLY_FULL = True
@@ -148,16 +142,16 @@ _V10_RECIP_LEAD_FULL = 0
 # one reciprocal instruction for both heads of a set (needs (b-1)*HS + HS-1 <= exp_ahead + norm_lag - lead)
 _V10_RECIP_PAIR_SWA = True
 _V10_RECIP_PAIR_FULL = False
-# final merge (attn_fwd_A idea v45 grafted onto the attn_fwd_B kernel): the next head set's K^T and Q^T transposing
+# the next head set's K^T and Q^T transposing
 # loads are issued as hardware-DGE dma_transposes (dge_mode=hwdge, 16-token source tiles, 4 KB packets on the hardware
 # DGE queues) instead of static-descriptor transposes; same data, same destination layout, same anchored triggers.
-# Measured on the production NEFF (cores 36-37, interleaved): sw512 -1.5%, sw0 -0.6%, outputs bitwise identical.
+# Measured: sw512 -1.5%, sw0 -0.6%, outputs bitwise identical.
 _V11_HWDGE_KQ_SWA = True
 _V11_HWDGE_KQ_FULL = True
 # the initial (set 0) K^T / Q^T loads use the same hardware-DGE form.
 _V11_HWDGE_KQ_INIT_SWA = True
 _V11_HWDGE_KQ_INIT_FULL = True
-# gen3 port (trn2): nisa.activate2 is gen4-only.  'negmin': the TSCR stage produces -rowmax (scale by -softmax_scale,
+# trn2 has no nisa.activate2.  'negmin': the TSCR stage produces -rowmax (scale by -softmax_scale,
 # min-reduce) so the exp is a plain nisa.activation(exp, scale=-1.0, bias=-rowmax) with no extra instruction;
 # 'negate': keep +rowmax and negate it once per group on ScalarE (activation copy, scale=-1.0).  Both are fp32-bitwise
 # equivalent to activate2's (in - imm0).
@@ -169,8 +163,8 @@ _PSUM_BANK_BYTES = 2048
 
 def _psum_at(shape, dtype, bank, offset=0):
     """A PSUM tile at a fixed bank and byte offset (per partition). The forward kernel places all its PSUM
-    tiles this way, as nkilib attention does: neuronx-cc 2.0.410046 gives each compiler-placed PSUM tensor its own
-    2 KiB bank, which over-subscribes the 8 banks and crashes its PSUM spill pass."""
+    tiles this way, as nkilib attention does, so that they share the 8 PSUM banks (2 KiB each) instead of taking
+    one bank per tensor."""
     return nl.ndarray(shape, dtype=dtype, buffer=nl.psum, address=(0, bank * _PSUM_BANK_BYTES + offset))
 
 
@@ -2443,7 +2437,7 @@ def bthd_flash_fwd(
 # Backward
 # ---------------------------------------------------------------------------
 #
-# Round-0 restructure (attn_bwd_B). Compared with the vendored version:
+# Design:
 #   * per plane, Q / dY (both orientations), O rows and per-section K / V / K^T
 #     are DMA'd once into SBUF (double-buffered across planes) in the layouts
 #     TensorE needs, so no nc_transpose is spent on inputs;
@@ -2453,20 +2447,20 @@ def bthd_flash_fwd(
 #   * pairs are visited key-tile-outer, so the pairs touching one dK/dV tile
 #     are consecutive and accumulate in PSUM; dQ accumulates in PSUM too when
 #     its pairs are consecutive (sliding window) and in SBUF fp32 otherwise;
-#   * gradients are evicted once by ScalarE straight to bf16 and stored via
-#     DMA transpose; dQ uses one N<=512 matmul per key sub-tile.
-# Round 3: every SBUF tensor is placed explicitly (hand-rotated rings), the lse of
-#   the whole shard is loaded once.
-# Round 4: the dQ matmuls of a pair are deferred behind the recompute of the next
-#   pair(s) (software pipelining across pairs); on full-causal layers the dS^T of
-#   the fully visible pairs comes from a DMA round trip through a private HBM
-#   scratch instead of TensorE transposes, and Q^T / dY^T are built by TensorE
-#   from the token-major rows to relieve the (then saturated) DMA fabric.
-# Round 5: the dQ/dK/dV PSUM evictions run on VectorE (ScalarE's in-order queue
-#   otherwise holds the dS^T scratch copies -- and through them the TensorE
-#   transposes -- behind the evictions in the tile-ending pairs); K rows are kept
-#   per 2048-token section so the deferred dQ of a section's last pairs reads the
-#   right rows for seqlen > 2048.
+#   * gradients are evicted from PSUM once, straight to bf16, and stored via
+#     DMA transpose; dQ uses one N<=512 matmul per key sub-tile;
+#   * every SBUF tensor is placed explicitly (hand-rotated rings), the lse of
+#     the whole shard is loaded once;
+#   * the dQ matmuls of a pair are deferred behind the recompute of the next
+#     pair(s) (software pipelining across pairs); on full-causal layers the dS^T of
+#     the fully visible pairs comes from a DMA round trip through a private HBM
+#     scratch instead of TensorE transposes, and Q^T / dY^T are built by TensorE
+#     from the token-major rows to relieve the DMA queues;
+#   * the dK/dV (and on sliding-window layers the dQ) PSUM evictions run on VectorE
+#     (on ScalarE, its in-order queue would hold the dS^T scratch copies -- and
+#     through them the TensorE transposes -- behind the evictions in the
+#     tile-ending pairs); K rows are kept per 2048-token section so the deferred
+#     dQ of a section's last pairs reads the right rows for seqlen > 2048.
 
 _BWD_KBLK = 128
 _BWD_DELTA_REDUCE = "vector"  # "vector": VectorE tensor_reduce | "scalar": ScalarE activation reduce
@@ -2483,7 +2477,7 @@ _BWD_DQ_DEFER_SW512 = 1
 # Key blocks of fully visible pairs whose dS^T is produced by DMA (dS rows -> private HBM scratch -> transposed
 # HWDGE read) instead of TensorE transposes + ScalarE copies.  Full-causal layers only: the sliding-window
 # layers keep the DMA fabric busy with their own loads/stores and lose with any dS^T traffic.
-_BWD_DMA_TP_FULL_SW0 = [0, 1]  # gen3 (trn2): was [0, 1, 2, 3]; [] 3319 us, [0,1] 3096 us, [0,1,2,3] 4022 us (prod NEFF)
+_BWD_DMA_TP_FULL_SW0 = [0, 1]  # trn2: [] 3319 us, [0, 1] 3096 us, [0, 1, 2, 3] 4022 us
 _BWD_DMA_TP_FULL_SW512 = []
 _BWD_DS_HBM_SLOTS = 4  # HBM scratch slots (pairs) for the dS round trip
 # Full-causal layers: build the transposed Q / dY with TensorE transposes + ScalarE copies from the token-major
@@ -2493,13 +2487,13 @@ _BWD_QT_TENSORE_SW0 = 1
 # always on VectorE.
 _BWD_DQ_EVICT_VECTOR_SW512 = 1
 _BWD_DQ_EVICT_VECTOR_SW0 = 0
-# Position of the deferred dQ block (matmuls + eviction) of pair i-d inside the step of pair i (merge round):
+# Position of the deferred dQ block (matmuls + eviction) of pair i-d inside the step of pair i:
 #   1 = after dS (before the dS^T transposes), 2 = after the dS^T transposes (before dV/dK), 3 = after dV/dK.
-_BWD_DQ_POS_SW512 = 2  # gen3 (trn2): was 1 (2389 us); 2 -> 2274 us (prod NEFF)
+_BWD_DQ_POS_SW512 = 2  # trn2: 1 -> 2389 us, 2 -> 2274 us
 _BWD_DQ_POS_SW0 = 2
-# Usable SBUF bytes per partition for the explicit placement (gen4: 245752); the P/dS ring shrinks when the
+# Usable SBUF bytes per partition for the explicit placement; the P/dS ring shrinks when the
 # placement would not fit (only seqlen 8192 with many planes per shard; the pretrain shapes keep the default).
-_BWD_SBUF_BYTES = 212984  # gen3 (trn2) usable SBUF; gen4 was 245752
+_BWD_SBUF_BYTES = 212984  # trn2
 
 
 def _bwd_load_bthd_transposed(

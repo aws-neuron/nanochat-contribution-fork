@@ -1,6 +1,6 @@
 """Pure NKI kernel code for the Trainium backend (no torch autograd, no nanochat model knowledge).
 
-  attention_bthd.py  BTHD-native flash attention forward / backward (vendored)
+  attention_bthd.py  BTHD-native flash attention forward / backward
   embedding.py       sorted one-hot-matmul embedding backward (scatter-add)
 
 torch_neuronx names compiled NKI kernels by the kernel function's __qualname__ (the HLO custom call) and keys the

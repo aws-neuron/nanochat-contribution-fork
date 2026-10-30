@@ -6,11 +6,12 @@ trap 'echo "speedrun failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 # nanochat Speedrun on AWS Trainium (64 LNC2 NeuronCores). The Trainium counterpart of runs/speedrun.sh:
 # same stages, same order; it differs only in the stage commands (rank counts, the Trainium recipe flags, LNC1 for
-# chat_eval), the fresh-cache note, the compile-service guard and the base-dir guard.
+# chat_eval), the Neuron environment settings, the fresh-cache note, two guards (compile service, base dir) and the
+# SFT / chat_eval dataset prefetch, which runs in the background during pretraining.
 #
 # 1) Example launch (simplest):
 # bash runs/speedrun_trn.sh
-# 2) Example launch in a screen session (because the run takes ~2 hours):
+# 2) Example launch in a screen session (because the run takes ~3 hours):
 # screen -L -Logfile runs/speedrun_trn.log -S speedrun bash runs/speedrun_trn.sh
 # 3) Example launch with wandb logging, but see below for setting up wandb first:
 # WANDB_RUN=speedrun screen -L -Logfile runs/speedrun_trn.log -S speedrun bash runs/speedrun_trn.sh
@@ -22,17 +23,17 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 mkdir -p $NANOCHAT_BASE_DIR
 
 # -----------------------------------------------------------------------------
-# Python venv: the Neuron SDK venv must already be active (neuronx-cc must resolve on PATH; torch_neuronx silently
-# deadlocks in synchronize() otherwise).
+# Python venv: the Neuron SDK venv must already be active (neuronx-cc must resolve on PATH: torch_neuronx compiles
+# every graph with it).
 command -v neuronx-cc >/dev/null || { echo "neuronx-cc not on PATH: activate the Neuron venv first"; exit 1; }
 export NEURON_LOGICAL_NC_CONFIG=2
 export NEURON_CC_FLAGS="--optlevel 1"
 export TORCH_NEURONX_LOG_LEVEL=WARNING
 
 # Compile-service guard. torch_neuronx compiles NEFFs through an asynchronous worker pool unless
-# NEURON_COMPILE_SERVICE=0 is exported (some shells do that so a SIGINT cannot kill a shared service). A
-# speedrun launched from such a shell would compile every stage synchronously: +100 s on cold step 0, base_eval
-# 7.5 -> 9.5 min, chat_eval 16 -> 24 min. Drop an inherited value.
+# NEURON_COMPILE_SERVICE=0 is exported. A speedrun launched from a shell that exports it would compile every
+# stage synchronously: +100 s on cold step 0, base_eval 7.5 -> 9.5 min, chat_eval 16 -> 24 min. Drop an inherited
+# value.
 if [ -n "${NEURON_COMPILE_SERVICE:-}" ]; then
     echo "note: dropping inherited NEURON_COMPILE_SERVICE=$NEURON_COMPILE_SERVICE (the async compile service stays on)"
     unset NEURON_COMPILE_SERVICE

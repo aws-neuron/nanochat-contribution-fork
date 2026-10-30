@@ -2,9 +2,9 @@
 
 Pure kernel module; the token-sort plan and the autograd.Function live in nanochat/trn/embedding.py.
 
-Why: the production step lowers ``aten::embedding_dense_backward`` (13 launches per step: wte + 12 value-embedding
-tables, 16384 token rows x 1536 bf16 into a 32768-row table) to an HLO scatter that neuronx-cc runs as a serialized
-per-row read-modify-write on one physical core: ~11.4 ms per launch, ~148 ms per step. A scatter-add of 50 MB should
+Why: the default ``aten::embedding_dense_backward`` (13 launches per step: wte + 12 value-embedding tables, 16384
+token rows x 1536 bf16 into a 32768-row table) is an HLO scatter that runs as a serialized per-row
+read-modify-write on one physical core: ~11.4 ms per launch, ~148 ms per step. A scatter-add of 50 MB should
 take a fraction of a millisecond.
 
 How (exact, race-free, no atomics):

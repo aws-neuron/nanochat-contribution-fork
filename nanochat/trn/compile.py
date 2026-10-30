@@ -18,7 +18,7 @@ caches) take minutes at any rank count even though the compiler service compiles
 1. torch_neuronx's NeuronOutputCode._ensure_neff_loaded() ends with torch.neuron.synchronize() the FIRST time a
    torch.compile'd graph is executed. That waits for the graph's own asynchronous neuronx-cc compile before Python
    can trace the next graph, so the Block forwards, the CE forward/backward, the Block backwards and the optimizer
-   graphs compile strictly one after another. (Not patched here; file it against torch_neuronx.)
+   graphs compile strictly one after another.
 
 2. Each NKI kernel is compiled to BIR (TorchNeuronNKIKernelV3.dump_config) by the first rank that traces it while
    every other rank waits on the same FileLock, and all ranks then move to the same next kernel: the kernels of a
@@ -61,8 +61,8 @@ def compile_model(model, batch_size=None, seq_len=None, reference=None):
     First the compile, then -- given the training shape (batch_size, seq_len) -- the NKI kernel prewarm across
     ranks (prewarm_nki_kernels).
 
-    neuronx-cc chokes on the full model graph (compile time / memory), while each Block -- norm + attention + MLP,
-    see Block.forward -- is a well-formed subgraph that compiles cleanly. The 24 Blocks share one code object, so
+    One graph per Block instead of one for the whole model: each Block -- norm + attention + MLP, see Block.forward --
+    is a compact subgraph that compiles quickly and with little host memory. The 24 Blocks share one code object, so
     dynamo dedupes them by structure into one compiled graph pair per (window, has value embedding) pattern (3 at d24
     SSSL); the value embedding is a graph input. Everything outside the Blocks (embeddings, residual mix, lm_head + CE)
     runs eagerly or in its own compiled graph (nanochat/trn/fused_ce.py).

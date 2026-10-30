@@ -1,6 +1,6 @@
 """DistMuonAdamW for AWS Trainium: fp32 master shards + the fused 6-launch step.
 
-Same algorithm and hyperparameters as nanochat.optim.DistMuonAdamW (AdamW for embeddings / lm_head / scalars,
+Same algorithm and hyperparameters as nanochat.optim.MuonAdamW (AdamW for embeddings / lm_head / scalars,
 Muon for the matrices, ZeRO-2 style sharding); the Trainium version differs in three things that were all
 measured on trn3 at d24 / 64 ranks:
 
@@ -21,16 +21,15 @@ measured on trn3 at d24 / 64 ranks:
      a. adamw_reduce   ONE graph: 14 reduce_scatter(avg) into persistent grad slices + 5 all_reduce(avg)
      b. muon_pack_rs   ONE graph: orient (+bf16->fp32), stack and reduce_scatter(avg) EVERY Muon group
      c. muon_step_fused per group (3 kernels): the unchanged Muon update on this rank's owned chunk. It stays in
-        its own graph because its bf16 Polar Express is sensitive to the compiler's matmul choices inside a
-        bigger graph (fusing everything into 1-2 graphs is 10-27 % slower and drifts the masters).
+        its own graph: inside a bigger graph its bf16 Polar Express matmuls are scheduled differently (fusing
+        everything into 1-2 graphs is 10-27 % slower and drifts the masters).
      d. finish_all     ONE graph: the AdamW updates (this rank's slice of each large param, then all_gather into
         the param; the small replicated params in place) + every Muon group's fp32->bf16 staging + all_gather +
         copy-back with the transposes. The rank enters as a (1,) device tensor so all ranks share one NEFF.
    6 launches, 3 collective NEFFs, 2 kernel<->collective switches: 99.6 -> 61.8 ms at 32 ranks, bitwise
    identical to the eager schedule (701/701 and 2259/2259 state tensors).
 
-State layout (keys, shapes, dtypes, rank ownership) is unchanged from the eager Trainium optimizer, so existing
-checkpoints load; `load_state_dict` keeps the fp32 states fp32 (torch would downcast them to the bf16 param dtype).
+`load_state_dict` keeps the fp32 states fp32 (torch would downcast them to the bf16 param dtype).
 """
 import torch
 import torch.distributed as dist
@@ -47,9 +46,8 @@ def _compile(fn):
 
 
 def _zeros(*shape, dtype, device):
-    """torch.zeros(..., device=) with the fill done by zero_(): TorchNeuron keys eager NEFFs by the op's
-    arguments INCLUDING the device kwarg, so torch.zeros(..., device="neuron:k") compiles one NEFF per rank
-    (~3 s each, all at step 0) while zero_() keys on shape/dtype only and compiles once per host. Same bytes."""
+    """torch.zeros(..., device=) with the fill done by zero_(): the eager zero_() kernel is cached by shape and
+    dtype, so it compiles once per host instead of once per rank device (~3 s each, all at step 0). Same bytes."""
     return torch.empty(*shape, dtype=dtype, device=device).zero_()
 
 
@@ -69,8 +67,8 @@ def muon_step_fused(
     """nanochat.optim.muon_step_fused (momentum -> MuonEq -> polar_express -> Muon+ -> variance_reduction ->
     cautious_update) with two Trainium adaptations: the momentum EMA runs in the BUFFER's dtype (fp32 here even if
     the grads arrive bf16; `.to` of the same dtype is a no-op, so with fp32 grads this is exactly upstream's in-place
-    form), and a chunk of ONE matrix is squeezed to 2-D for the Polar Express matmuls (batch-1 3-D bmm fails
-    neuronx-cc's prologue merge; the bmm/mm results are the same). Everything else is upstream's math."""
+    form), and a chunk of ONE matrix is squeezed to 2-D for the Polar Express matmuls (mm instead of a batch-1
+    bmm; the results are the same). Everything else is upstream's math."""
     mb_dtype = momentum_buffer.dtype
     momentum = momentum_t.to(mb_dtype)
     g = stacked_grads.to(mb_dtype)
@@ -145,7 +143,7 @@ def _adamw_math(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, ep
     bias2 = 1 - beta2_t ** step_t
     denom = (exp_avg_sq32 / bias2).sqrt() + eps_t
     step_size = lr_t / bias1
-    # no tensor alpha: torch_neuronx cannot lower add_(..., alpha=<0-D tensor>)
+    # written without a tensor alpha; mathematically upstream's p32.add_(exp_avg32 / denom, alpha=-step_size)
     p32.sub_(exp_avg32 / denom * step_size)
     p.copy_(p32)
     exp_avg.copy_(exp_avg32)
@@ -214,8 +212,8 @@ def _make_finish_graph(pg, world_size, group_flags):
 # -----------------------------------------------------------------------------
 
 class DistMuonAdamW(torch.optim.Optimizer):
-    """Distributed Muon + AdamW on Trainium (see the module docstring). Drop-in for nanochat.optim.DistMuonAdamW:
-    same param_groups contract ('kind' adamw|muon with the same hyperparameter keys), same state_dict layout.
+    """Distributed Muon + AdamW on Trainium (see the module docstring); nanochat.optim.DistMuonAdamW on a Neuron
+    host. Same param_groups contract as nanochat.optim.MuonAdamW ('kind' adamw|muon with the same hyperparameter keys).
 
     Muon groups must be built with `muon_group_key` (GPT.setup_optimizer does), so a matrix and its transpose share a
     group; every member of a group must have the canonical shape or its transpose.
@@ -269,10 +267,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
 
     def _adamw_hparams(self, p, group: dict, step: int):
         """Per-PARAM persistent 0-D CPU tensors. Per param rather than per group on purpose: with one tuple shared
-        by the 12 value embeddings dynamo deduplicates the repeated inputs and neuronx-cc then compiles the shared
-        `1 - lr*wd` / `lr / bias1` scalars differently from the single-param kernel -- those params came out 1 bf16
-        ulp off in 22 % of their elements. Distinct 0-D inputs per param reproduce the eager kernel's graph structure
-        per tensor and are bitwise."""
+        by the 12 value embeddings dynamo deduplicates the repeated inputs, the graph then shares the `1 - lr*wd` /
+        `lr / bias1` scalars of those params, and they come out 1 bf16 ulp off the single-param kernel in 22 % of
+        their elements. Distinct 0-D inputs per param reproduce the eager kernel's graph structure per tensor and are
+        bitwise."""
         hp = self._adamw_hp.get(id(p))
         if hp is None:
             hp = tuple(torch.tensor(0.0, dtype=torch.float32, device="cpu") for _ in range(6))

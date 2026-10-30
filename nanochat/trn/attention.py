@@ -1,11 +1,8 @@
-"""Neuron attention for nanochat.
-
-Three pieces, all previously spread over nanochat/flash_attention.py, nki_attention.py and nki_attention_bthd.py:
+"""Neuron attention for nanochat. Three pieces:
 
 1. BTHD-native flash attention (the training path). BOTH forward and backward consume/produce native (B,T,H,D) --
    no q/k/v/o/dy/grad relayout anywhere. fwd = bthd_flash_fwd(return_lse=True), bwd = bthd_flash_bwd
-   (nanochat/trn/kernels/attention_bthd.py). Production-validated on pretrain + SFT: a full 5568+479-step run
-   matched the SDPA baseline's val bpb exactly (0.7058). Taken whenever the shapes allow AND gradients are being
+   (nanochat/trn/kernels/attention_bthd.py). Taken whenever the shapes allow AND gradients are being
    recorded: MHA (H_kv == H), sliding_window in {0, 512} (nanochat's L-layers map to 0 = full causal, S-layers to
    512), Q packed in 16 tiles of 128 tokens (T % 2048 == 0). The no-grad forwards of the eval stages (base_eval's
    CORE buckets and bpb batches, whose (8, 2048) shape equals the training shape) keep the SDPA path so the reported
@@ -14,7 +11,7 @@ Three pieces, all previously spread over nanochat/flash_attention.py, nki_attent
 
 2. nkilib sliding-window attention for the SDPA fallback's S-layers ((B,H,T,D) layout, attention_cte /
    attention_bwd with their native `sliding_window`): avoids materializing the T x T score matrix that SDPA + an
-   explicit attn_mask would produce on Neuron (the compiler's flash-attention gate rejects non-None attn_bias).
+   explicit attn_mask would produce on Neuron (SDPA with an explicit mask does not take the fused flash-attention path).
 
 3. The Neuron flavour of nanochat.flash_attention's public API: flash_attn_func (BTHD kernel, else SDPA with
    contiguous (B,H,T,D) inputs -- strided views fall off the fused kernel path) and flash_attn_with_kvcache
@@ -154,9 +151,6 @@ def nki_flash_attn_swa(q, k, v, window_size):
 # ---------------------------------------------------------------------------------------------------------
 BTHD_NKI_AVAILABLE = False
 try:
-    # Kernels vendored as nanochat/trn/kernels/attention_bthd.py. They used to be imported from an absolute path
-    # outside the repo, which meant any other checkout silently lost the BTHD path: the ImportError below is
-    # swallowed, BTHD_NKI_AVAILABLE ends up False, and training quietly ran slower SDPA with nothing in the log to say why.
     from nanochat.trn.kernels.attention_bthd import bthd_flash_fwd, bthd_flash_bwd
     from torch_neuronx.nki_hop import wrap_nki
     from torch_neuronx.utils import get_logical_neuron_cores
@@ -182,7 +176,7 @@ class _BTHDFlashAttn(torch.autograd.Function):
 
         # NATIVE BTHD — no reshape, no transpose, NO pre-scale buffer. Passing
         # softmax_scale to the kernel (vs q*scale) avoids a 24MiB/layer copy
-        # that would also be saved for backward (see BTHD TRAINING.md).
+        # that would also be saved for backward.
         out, lse = _bthd_wrapped_fwd[grid](
             q, k, v,
             softmax_scale=softmax_scale,

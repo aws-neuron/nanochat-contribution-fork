@@ -1,7 +1,7 @@
 """Neuron embedding lookups whose backward runs the NKI scatter-add kernel (nanochat/trn/kernels/embedding.py).
 
-`embedding(idx, weight)` is F.embedding(idx, weight) with (a) int32 indices -- TorchNeuron lowers int64 indices
-through a "NeuronSafeCast" CPU round-trip (device->host copy + two stream synchronizes) on EVERY call, and a forward
+`embedding(idx, weight)` is F.embedding(idx, weight) with (a) int32 indices -- on Neuron, int64 indices take a host
+round trip (device->host copy + two stream synchronizes) on every call, and a forward
 does 13 lookups (wte + 12 value-embedding tables); the gathered rows are bitwise identical -- and (b) in training the
 kernel backward: NKI sorted one-hot-matmul scatter-add (exact fp32 sum, one bf16 rounding, like torch's formula)
 instead of the ~11 ms eager HLO scatter. One plan (token sort, ~1.5 ms of torch ops) per forward is shared by wte and
