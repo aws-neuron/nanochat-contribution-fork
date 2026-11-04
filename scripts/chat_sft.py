@@ -43,7 +43,7 @@ parser.add_argument("--model-tag", type=str, default=None, help="model tag to lo
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
 parser.add_argument("--save-optimizer", type=int, default=1, help="save the optimizer shards with the SFT checkpoint (0=no, 1=yes)")
-parser.add_argument("--activation-checkpoint", type=int, default=-1, help="checkpoint each Block's attn and mlp region (1=on, 0=off, -1 = inherit from pretrain)")
+parser.add_argument("--activation-checkpoint", type=int, default=-1, help="checkpoint each Block (1=on, 0=off, -1 = inherit from pretrain)")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes (default: inherit from pretrained checkpoint)

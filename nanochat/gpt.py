@@ -43,8 +43,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # Activation checkpointing: recompute each Block's attn / mlp region in the backward instead of keeping its
-    # activations live (two regions per Block, see Block.forward). Default FALSE = upstream (no checkpointing).
+    # Activation checkpointing: recompute each Block in the backward instead of keeping its activations live (one
+    # region per Block, see Block.forward). Default FALSE = upstream (no checkpointing).
     # On Trainium d24 at MBS>=4 does not fit without it; the speedrun pretrains at MBS 2 without it and runs SFT at
     # MBS 8 with it (chat_sft --activation-checkpoint).
     # A config field rather than an env var so it travels with the model into the checkpoint meta.
@@ -162,25 +162,19 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.activation_checkpoint = config.activation_checkpoint
 
-    def _fwd_attn(self, x, ve, cos_sin, window_size, kv_cache):
-        return self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-
-    def _fwd_mlp(self, x):
-        return self.mlp(norm(x))
-
-    def _checkpoint(self, function, *args):
-        return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant=False, preserve_rng_state=False)
+    def _forward(self, x, ve, cos_sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+        x = x + self.mlp(norm(x))
+        return x
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        # Two checkpoint regions (attn, then mlp): measurably faster than one region over the whole Block on
-        # Trainium (2164.9 vs 2184.4 ms/step at d24). Training-only: under no_grad there is nothing to recompute.
+        # One checkpoint region over the whole Block. With two regions (attn, then mlp) the compiled Trainium
+        # backward of SDPA attention gives non-finite q / k gradients at d24 MBS 8. Training-only: under no_grad
+        # there is nothing to recompute.
         if self.activation_checkpoint and torch.is_grad_enabled():
-            x = x + self._checkpoint(self._fwd_attn, x, ve, cos_sin, window_size, kv_cache)
-            x = x + self._checkpoint(self._fwd_mlp, x)
-        else:
-            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-            x = x + self.mlp(norm(x))
-        return x
+            return torch.utils.checkpoint.checkpoint(self._forward, x, ve, cos_sin, window_size, kv_cache,
+                                                     use_reentrant=False, preserve_rng_state=False)
+        return self._forward(x, ve, cos_sin, window_size, kv_cache)
 
 
 class GPT(nn.Module):
