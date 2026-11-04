@@ -49,9 +49,9 @@ class NeuronBackend(TorchBackend):
         model.transformer.h.to(dtype=COMPUTE_DTYPE)
         model.to(device=device)
 
-    def compile_model(self, model, batch_size=None, seq_len=None):
+    def compile_model(self, model):
         from nanochat.trn import compile as _compile
-        return _compile.compile_model(model, batch_size=batch_size, seq_len=seq_len, reference=super().compile_model)
+        return _compile.compile_model(model, reference=super().compile_model)
 
     def prefetch_after_optimizer_step(self, device_type):
         # The host->device copy in next(train_loader) synchronizes the stream, so a prefetch right after backward()

@@ -17,9 +17,7 @@ Hooks (T = torch.Tensor)
                                     fused lm_head + softcap + mean CE for training, or None (gpt.py computes it)
   peak_flops(device_type: str) -> float
   materialize(model, device) -> None                (to_empty + init_weights)
-  compile_model(model, batch_size=None, seq_len=None) -> model
-                                    upstream: torch.compile(model, dynamic=False); a backend may also pre-compile
-                                    kernels for the (batch_size, seq_len) training shape
+  compile_model(model) -> model     upstream: torch.compile(model, dynamic=False)
   prefetch_after_optimizer_step(device_type: str) -> bool
   empty_cache(device_type: str) -> None
 """
@@ -46,7 +44,7 @@ class TorchBackend:
         model.to_empty(device=device)  # all tensors get storage on the target device, uninitialized
         model.init_weights()
 
-    def compile_model(self, model, batch_size=None, seq_len=None):
+    def compile_model(self, model):
         return torch.compile(model, dynamic=False)  # the inputs never change shape so dynamic=False is safe
 
     def prefetch_after_optimizer_step(self, device_type):

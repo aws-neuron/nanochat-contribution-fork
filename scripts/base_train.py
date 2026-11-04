@@ -245,8 +245,7 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-# upstream: torch.compile(model, dynamic=False). Trainium: one compiled graph per Block + NKI kernel prewarm for the training shape
-model = backend.compile_model(model, batch_size=args.device_batch_size, seq_len=args.max_seq_len)
+model = backend.compile_model(model) # upstream: torch.compile(model, dynamic=False). Trainium: one compiled graph per Block
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.

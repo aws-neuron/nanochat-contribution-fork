@@ -126,7 +126,7 @@ if args.activation_checkpoint >= 0:
 print0(f"Activation checkpointing: {model.config.activation_checkpoint}")
 
 orig_model = model
-model = backend.compile_model(model, batch_size=args.device_batch_size, seq_len=args.max_seq_len)
+model = backend.compile_model(model)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
