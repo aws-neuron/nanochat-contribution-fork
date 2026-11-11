@@ -125,6 +125,9 @@ wait $BASE_EVAL_SAMPLE_PID
 # of them, so MBS 2 x 4 would change the objective (and lowers the chat scores). The SFT optimizer shards have no
 # consumer, so they are not written (64 x 6 GB).
 wait $TASK_PREFETCH_PID
+# SFT compiles the checkpointed Blocks with the hierarchy splitter off: about 1.7x faster per step there with
+# the current compiler. Pretraining (no checkpointing) is slightly faster with the default, so it keeps it.
+NEURON_CC_FLAGS="$NEURON_CC_FLAGS --internal-hlo2tensorizer-options=--hierarchy-splitter=false" \
 NEURON_USE_SPLIT_REDUCE_SCATTER=1 NEURON_USE_SPLIT_ALLGATHER=1 COLLECTIVE_BUCKETSIZE_IN_MB=2304 \
 torchrun --standalone --nproc_per_node=64 -m scripts.chat_sft -- --device-batch-size=8 --activation-checkpoint=1 --eval-every=-1 --chatcore-every=-1 --save-optimizer=0 --run=$WANDB_RUN
 # chat_eval on 128 LNC1 ranks (one physical core each: ~2x the generative throughput of LNC2-64), static-shape
