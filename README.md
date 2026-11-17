@@ -111,6 +111,20 @@ The important thing to note is that nanochat is written and configured around on
 
 The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
 
+## Running on AWS Trainium
+
+Tested on trn2.48xlarge in the `public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.1-ubuntu26.04` image. The image already ships torch and torch-neuronx, so install the other dependencies with pip (`uv sync` would replace torch):
+
+```bash
+pip install filelock kernels numpy psutil pyarrow requests rustbpe tiktoken wandb
+export NANOCHAT_DTYPE=bfloat16 OMP_NUM_THREADS=1
+python -m nanochat.dataset -n 2
+python -m scripts.tok_train --max-chars=50000000
+python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --total-batch-size=512 --num-iterations=20 --eval-every=-1 --eval-tokens=512 --core-metric-every=-1 --sample-every=-1
+```
+
+The `neuron` device is detected automatically. To use several NeuronCores, launch with `torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- ...` and multiply `--total-batch-size` by the process count. The first step compiles, which takes 20 to 40 seconds.
+
 ## Precision / dtype
 
 nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
