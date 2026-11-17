@@ -10,6 +10,13 @@ import torch
 import torch.distributed as dist
 from filelock import FileLock
 
+try:
+    import torch_neuronx  # noqa: F401  installed only on AWS Trainium hosts
+    torch.compiler.set_default_backend("neuron")  # every torch.compile below targets Neuron
+    torch._dynamo.config.enable_dynamo_decompositions = False  # Dynamo otherwise emits an Inductor-only fma op (add_ with tensor alpha)
+except ImportError:
+    torch_neuronx = None
+
 # The dtype used for compute (matmuls, activations). Master weights stay fp32 for optimizer precision.
 # Linear layers cast their weights to this dtype in forward, replacing torch.amp.autocast.
 # Override with NANOCHAT_DTYPE env var: "bfloat16", "float16", "float32"
@@ -164,6 +171,8 @@ def autodetect_device_type():
     # prefer to use CUDA if available, otherwise use MPS, otherwise fallback on CPU
     if torch.cuda.is_available():
         device_type = "cuda"
+    elif torch_neuronx is not None:
+        device_type = "neuron"
     elif torch.backends.mps.is_available():
         device_type = "mps"
     else:
@@ -174,7 +183,7 @@ def autodetect_device_type():
 def compute_init(device_type="cuda"): # cuda|cpu|mps
     """Basic initialization that we keep doing over and over, so make common."""
 
-    assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
+    assert device_type in ["cuda", "neuron", "mps", "cpu"], "Invalid device type atm"
     if device_type == "cuda":
         assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
     if device_type == "mps":
@@ -199,6 +208,10 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+    elif is_ddp_requested and device_type == "neuron":
+        device = torch.device("neuron")  # torchrun gives each rank its own NeuronCore
+        dist.init_process_group(backend="neuron")
         dist.barrier()
     else:
         device = torch.device(device_type) # mps|cpu
