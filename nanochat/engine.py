@@ -179,7 +179,7 @@ class Engine:
         device = self.model.get_device()
         # Allocate the KV cache in the compute dtype so it matches what the forward pass emits
         dtype = COMPUTE_DTYPE
-        rng = torch.Generator(device=device)
+        rng = torch.Generator(device="cpu" if device.type == "neuron" else device)  # multinomial runs on CPU on Neuron
         rng.manual_seed(seed)
 
         # Get the special tokens we need to coordinate the tool use state machine
