@@ -123,7 +123,7 @@ python -m scripts.tok_train --max-chars=50000000
 python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --total-batch-size=512 --num-iterations=20 --eval-every=-1 --eval-tokens=512 --core-metric-every=-1 --sample-every=-1
 ```
 
-The `neuron` device is detected automatically. To use several NeuronCores, launch with `torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- ...` and multiply `--total-batch-size` by the process count. The first step compiles, which takes 20 to 40 seconds.
+The `neuron` device is detected automatically. To use several NeuronCores, launch with `torchrun --standalone --nproc_per_node=4 -m scripts.base_train -- ...` and multiply `--total-batch-size` by the process count. The first step compiles, which takes 20 to 50 seconds. Keep `--sample-every=-1 --core-metric-every=-1` during training on Neuron (in-training sampling took about 15 minutes at d6) and evaluate afterwards with `scripts.base_eval`. Tested through d12 on one NeuronCore; d24 needs more than one NeuronCore's memory.
 
 ## Precision / dtype
 
