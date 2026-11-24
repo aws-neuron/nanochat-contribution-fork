@@ -162,6 +162,14 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
 
     # SDPA fallback: manually manage KV cache
     B, T_new, H, D = q.shape
+    if q.device.type == "neuron" and T_new == 1:  # fixed shapes: Neuron compiles a new graph per shape, so attend the whole cache with a mask
+        pos = cache_seqlens[:1].long()
+        k_cache.index_copy_(1, pos, k)
+        v_cache.index_copy_(1, pos, v)
+        col = torch.arange(k_cache.size(1), device=q.device)
+        mask = (col <= pos) & (col >= pos - window_size[0]) if window_size[0] >= 0 else col <= pos
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k_cache.transpose(1, 2), v_cache.transpose(1, 2), attn_mask=mask.view(1, 1, 1, -1), enable_gqa=H != k_cache.size(2))
+        return y.transpose(1, 2)
     pos = cache_seqlens[0].item()  # assume uniform position across batch
 
     # Insert new k, v into cache (in-place, matching FA3 behavior)

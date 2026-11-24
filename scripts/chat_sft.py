@@ -205,11 +205,14 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     it = 0  # iteration counter
 
     def refill_buffer():
-        nonlocal cursor, epoch
+        nonlocal cursor, epoch, consumed
         while len(conv_buffer) < buffer_size:
             conversation = dataset[cursor]
             ids, mask = tokenizer.render_conversation(conversation)
-            conv_buffer.append((ids, mask))
+            if any(mask):
+                conv_buffer.append((ids, mask))
+            else:  # truncation at 2048 tokens cut off every assistant token: 0 targets would make the loss 0/0 = NaN
+                consumed += ddp_world_size
             cursor += ddp_world_size
             if cursor >= dataset_size:
                 cursor = cursor % dataset_size

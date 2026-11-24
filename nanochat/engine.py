@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from collections import deque
 from nanochat.common import compute_init, autodetect_device_type, COMPUTE_DTYPE
 from nanochat.checkpoint_manager import load_model
+from nanochat.gpt import norm
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -194,28 +195,36 @@ class Engine:
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
-            batch_size=1,
-            seq_len=len(tokens),
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
-        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        if device.type == "neuron":  # fixed shapes (Neuron compiles one graph per shape): pad the prompt to a multiple of 256, prefill into a full-length cache
+            n, L = len(tokens), min(-(-len(tokens) // 256) * 256, m.sequence_len)
+            kv_cache_decode = KVCache(batch_size=num_samples, seq_len=m.sequence_len, device=device, dtype=dtype, **kv_model_kwargs)
+            ids = torch.tensor([tokens + [bos] * (L - n)] * num_samples, dtype=torch.long, device=device)
+            logits = self.model.forward(ids, kv_cache=kv_cache_decode).index_select(1, torch.tensor([n - 1], device=device))[:, 0, :]
+            kv_cache_decode.cache_seqlens.fill_(n)  # positions past n hold padding; decode masks them and overwrites them
+            kv_cache_decode.prev_embedding = norm(self.model.transformer.wte(torch.tensor([[tokens[-1]]] * num_samples, device=device)).to(dtype))
+        else:
+            kv_cache_prefill = KVCache(
+                batch_size=1,
+                seq_len=len(tokens),
+                device=device,
+                dtype=dtype,
+                **kv_model_kwargs,
+            )
+            ids = torch.tensor([tokens], dtype=torch.long, device=device)
+            logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+            logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
-        # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
-            batch_size=num_samples,
-            seq_len=kv_length_hint,
-            device=device,
-            dtype=dtype,
-            **kv_model_kwargs,
-        )
-        kv_cache_decode.prefill(kv_cache_prefill)
-        del kv_cache_prefill # no need to keep this memory around
+            # 2) Replicate the KV cache for each sample/row
+            kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+            kv_cache_decode = KVCache(
+                batch_size=num_samples,
+                seq_len=kv_length_hint,
+                device=device,
+                dtype=dtype,
+                **kv_model_kwargs,
+            )
+            kv_cache_decode.prefill(kv_cache_prefill)
+            del kv_cache_prefill # no need to keep this memory around
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
