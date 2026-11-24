@@ -106,12 +106,16 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
         prompt_ids = [tokenizer.render_for_completion(conversation) for conversation in conversations] # TODO: remake the way this works
         max_length = max(len(ids) for ids in prompt_ids)
         answer_time_positions = [len(ids) - 1 for ids in prompt_ids] # where the last token is (and the predicted answer)
+        if device.type == "neuron": max_length = -(-max_length // 256) * 256  # Neuron compiles one graph per shape: pad to a 256-token bucket
         padded_prompt_ids = [ids + [bos] * (max_length - len(ids)) for ids in prompt_ids]
         prompt_ids = torch.tensor(padded_prompt_ids, dtype=torch.long, device=device)
 
         # Get the logits for the whole batch of conversations in parallel (efficiency win here)
         with torch.no_grad():
             logits = model(prompt_ids) # (B, T, V)
+        if device.type == "neuron":  # gather the answer positions on device with one fixed-shape index, then index on CPU
+            logits = logits[torch.arange(len(conversations), device=device), torch.tensor(answer_time_positions, device=device)].cpu().unsqueeze(1)
+            answer_time_positions = [0] * len(conversations)
 
         # Focus on the available answer on just the letters corresponding to choices
         # Note that this helps the evaluation a lot because it specifically narrows the focus to only the available letters
