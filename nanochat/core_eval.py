@@ -195,8 +195,8 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
 
     # Some models can't forward sequences beyond a certain length (e.g. GPT-2)
     # In these cases, we have to truncate sequences to max length and adjust the indices
-    if hasattr(model, 'max_seq_len') and model.max_seq_len is not None:
-        max_tokens = model.max_seq_len
+    max_tokens = getattr(model, 'max_seq_len', None) or (model.config.sequence_len if device.type == "neuron" else None)  # Neuron: crop to a fixed max length
+    if max_tokens is not None:
         new_tokens, new_start_idxs, new_end_idxs = [], [], []
         for t, s, e in zip(tokens, start_idxs, end_idxs):
             if len(t) > max_tokens:
