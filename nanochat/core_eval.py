@@ -215,10 +215,14 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     # Stack up all the sequences into a batch
     pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok
     input_ids = stack_sequences(tokens, pad_token_id)
+    if device.type == "neuron":  # Neuron compiles one graph per shape: pad every example to the full sequence length
+        input_ids = torch.nn.functional.pad(input_ids, (0, max(0, model.config.sequence_len - input_ids.size(1))), value=pad_token_id)
     input_ids = input_ids.to(device)
 
     # Forward the model, get the autoregressive loss and argmax prediction at each token
     losses, predictions = forward_model(model, input_ids)
+    if device.type == "neuron":  # slice on CPU: a device slice per continuation length would compile each time
+        losses, predictions, input_ids = losses.cpu(), predictions.cpu(), input_ids.cpu()
 
     # See if the losses/predictions come out correctly
     if task_type == 'language_modeling':
@@ -248,7 +252,7 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
-    correct = torch.zeros(len(data), dtype=torch.float32, device=device)
+    correct = torch.zeros(len(data), dtype=torch.float32)  # on CPU; moved to the device only for the all_reduce
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
         is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
@@ -256,6 +260,7 @@ def evaluate_task(model, tokenizer, data, device, task_meta):
     # sync results across all the processes if running distributed
     if world_size > 1:
         dist.barrier()
+        correct = correct.to(device)
         dist.all_reduce(correct, op=dist.ReduceOp.SUM)
     # compute the mean
     mean_correct = correct.mean().item()
