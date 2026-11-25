@@ -24,6 +24,8 @@ from nanochat.optim import MuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
+# AWS Trainium: int32 lookups and an NKI scatter-add embedding backward (plain F.embedding on other devices)
+from nanochat.trn.embedding import embedding as neuron_embedding
 
 @dataclass
 class GPTConfig:
@@ -48,6 +50,11 @@ class Linear(nn.Linear):
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
+
+
+def embed(table, idx):
+    """table(idx). On Neuron, the lookups of one forward share one token-sort plan for the NKI backward kernel."""
+    return neuron_embedding(idx, table.weight) if idx.device.type == "neuron" else table(idx)
 
 
 def has_ve(layer_idx, n_layer):
@@ -468,7 +475,7 @@ class GPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
+        x = embed(self.transformer.wte, idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
@@ -498,7 +505,7 @@ class GPT(nn.Module):
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            ve = embed(self.value_embeds[str(i)], idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x

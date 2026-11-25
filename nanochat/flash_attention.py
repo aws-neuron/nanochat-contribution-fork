@@ -70,6 +70,11 @@ def _resolve_use_fa3():
 
 USE_FA3 = _resolve_use_fa3()
 
+try:  # AWS Trainium: NKI flash attention kernel for training (nanochat/trn/attention.py)
+    from nanochat.trn.attention import bthd_attention
+except ImportError:  # no torch_neuronx / nki on this host
+    bthd_attention = None
+
 
 # =============================================================================
 # SDPA helpers
@@ -126,6 +131,10 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     """
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
+    if bthd_attention is not None and causal and q.device.type == "neuron":
+        y = bthd_attention(q, k, v, window_size)  # None when the kernel does not cover these shapes
+        if y is not None:
+            return y
 
     # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
